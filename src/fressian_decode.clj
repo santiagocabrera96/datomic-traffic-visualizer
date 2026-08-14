@@ -7,7 +7,7 @@
 
 (def ^:private tag-column-keys
   {"index-tdata"    [:v :e :a :t :added]
-   "index-dir-node" [:first-datom :id :unknown :datom-count]
+   "index-dir-node" [:first-datom :id :_ :datom-count]
    "index-root-node" [:first-datom :id]})
 
 (defn- unwrap-col

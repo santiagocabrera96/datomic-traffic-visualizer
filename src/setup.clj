@@ -230,6 +230,57 @@
   ;;   (require 'process)
   ;;   (process/write-diagram! {:since since :ignore-pod-coord? true})
 
+  ;; A sweep across the rest of the Datomic peer API, so a capture can be
+  ;; validated against every shape of traffic the pipeline needs to decode
+  ;; (not just the transact/pull pair above). Each form's wrapped in `region`
+  ;; so it shows up labeled in events.svg.
+
+  ;; Writes -- more item/id's so the queries below have something to chew on.
+  (region @(d/transact conn [{:item/id 1 :item/name "item-1" :item/payload "abc"}]))
+  (region @(d/transact conn [{:item/id 2 :item/name "item-2" :item/payload "abc"}
+                             {:item/id 3 :item/name "item-3"}]))
+  (region @(d/transact-async conn [{:item/id 4 :item/name "item-4"}]))
+  ;; Retract an attribute, then a whole entity.
+  (region @(d/transact conn [[:db/retract [:item/id 3] :item/name "item-3"]]))
+  (region @(d/transact conn [[:db/retractEntity [:item/id 4]]]))
+
+  (def db (region (d/db conn)))
+  ;; Reads: query.
+  (region (d/q '[:find ?e :where [?e :item/id]] db))
+  (region (d/q '[:find ?id ?name :in $ ?id :where [?e :item/id ?id] [?e :item/name ?name]]
+               db 1))
+  (region (d/q '[:find (count ?e) :where [?e :item/id]] db))
+
+  ;; Reads: pull/pull-many, entity/touch.
+  (region (d/pull db '[*] [:item/id 1]))
+  (region (d/pull-many db '[*] [[:item/id 1] [:item/id 2]]))
+  (region (d/touch (d/entity db [:item/id 1])))
+
+  ;; Reads: raw datoms/index access.
+  (region (into [] (d/datoms db :aevt :item/id)))
+  (region (into [] (d/index-range db :item/id nil nil)))
+  (region (d/entid db [:item/id 1]))
+
+  ;; Time travel: as-of/since/history, each queried the same way as `db`.
+  (region (d/q '[:find ?e :where [?e :item/id]] (d/as-of db (d/basis-t db))))
+  (region (d/q '[:find ?e :where [?e :item/id]] (d/since db (d/basis-t db))))
+  (region (d/q '[:find ?e ?v :where [?e :item/id ?v]] (d/history db)))
+
+  ;; `with`: speculative transact against a db value, no transactor round-trip.
+  (region (d/q '[:find ?e :where [?e :item/id]]
+               (:db-after (d/with db [{:item/id 5 :item/name "item-5"}]))))
+
+  ;; Log/tx-range: the transaction log itself, not just entity state.
+  (region (into [] (d/tx-range (d/log conn) nil nil)))
+
+  ; From @alex: Transactor will go put segments in memcache before announcing that an indexing job happened.
+
+  ;; Trigger an indexing job explicitly -- request-index asks the transactor
+  ;; to run one now rather than waiting for its usual schedule, so a capture
+  ;; can see the segment-to-memcache writes @alex's note above describes.
+  (region (do (d/request-index conn)
+              (Thread/sleep 1000)))
+
   (require 'process)
   (process/draw-diagram! "/tmp/tshark.log")
   (process/draw-diagram! (:tshark-log session) {:since (:since session)})
@@ -237,8 +288,7 @@
   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
   (process/draw-diagram! (:tshark-log session) {:since since})
 
-  ; From @alex: Transactor will go put segments in memcache before announcing that an indexing job happened.
 
   ;; Manual teardown.
-  (d/delete-database db-uri)
+  (region (d/delete-database db-uri))
   (stop-all! session))

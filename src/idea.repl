@@ -125,7 +125,7 @@
         {:keys [request-method request-line status body]} (http-fields http)
         body (unwrap-attribute-values body)]
     (some-vals {:protocol       :dynamodb
-                :timestamp      (->long timestamp)
+                :timestamp      timestamp
                 :stream         (->long (:tcp_tcp_stream tcp))
                 :srcport        (->long (:tcp_tcp_srcport tcp))
                 :dstport        (->long (:tcp_tcp_dstport tcp))
@@ -233,7 +233,7 @@
           to (+ 24 total)]
       (some-vals
         {:protocol  :memcache
-         :timestamp (->long timestamp)
+         :timestamp timestamp
          :stream    (->long (:tcp_tcp_stream tcp))
          :srcport   (->long (:tcp_tcp_srcport tcp))
          :dstport   (->long (:tcp_tcp_dstport tcp))
@@ -261,6 +261,15 @@
            (case protocol
              :dynamodb (decode-edn (decode-dynamo-body body))
              :memcache (some-> body fressian-decode/decode-body))))
+(defn parse-datomic-traffic
+  "Turns raw tshark records (as produced by parse-tshark) into decoded
+   datomic-traffic events: extracts each one's typed fields, then decodes its
+   body. Called with no args, returns the transducer, for composing into a
+   larger `comp` chain; called with a seq of records, applies it directly and
+   returns the resulting (lazy) seq -- same two-arity convention as
+   `clojure.core/map`/`filter`/etc."
+  ([] (map (comp decode-body extract-fields)))
+  ([records] (sequence (parse-datomic-traffic) records)))
 
 (def protocol-ports
   (into #{} (map (comp parse-long :port val)) protocols))
@@ -274,59 +283,84 @@
    a stream with several in-flight requests remembers each one in order);
    assumes responses come back in the same order their requests were sent,
    per stream. One pass over the seq, no need to hold it all in memory, and
-   no metadata added to surviving events."
-  [noisy?]
-  (fn [rf]
-    (let [pending (volatile! {})]
-      (fn
-        ([] (rf))
-        ([result] (rf result))
-        ([result e]
-         (let [stream (:stream e)]
-           (cond
-             (request? e)
-             (let [drop? (boolean (noisy? e))]
-               (vswap! pending update stream (fnil conj []) drop?)
-               (if drop? result (rf result e)))
+   no metadata added to surviving events.
 
-             (contains? @pending stream)
-             (let [drop? (first (get @pending stream))]
-               (vswap! pending update stream (comp vec rest))
-               (if drop? result (rf result e)))
+   Called with just `noisy?`, returns the transducer, for composing into a
+   larger `comp` chain; called with `noisy?` and a seq of events, applies it
+   directly and returns the resulting (lazy) seq -- same two-arity
+   convention as `clojure.core/map`/`filter`/etc."
+  ([noisy?]
+   (fn [rf]
+     (let [pending (volatile! {})]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result e]
+          (let [stream (:stream e)]
+            (cond
+              (request? e)
+              (let [drop? (boolean (noisy? e))]
+                (vswap! pending update stream (fnil conj []) drop?)
+                (if drop? result (rf result e)))
 
-             :else
-             (rf result e))))))))
+              (contains? @pending stream)
+              (let [drop? (first (get @pending stream))]
+                (vswap! pending update stream (comp vec rest))
+                (if drop? result (rf result e)))
+
+              :else
+              (rf result e))))))))
+  ([noisy? events] (sequence (remove-noise noisy?) events)))
+
+(defn- parse-line
+  "One tshark JSON line -> a seq of 0+ raw protocol-message records (usually
+   1, but a memcache TCP segment can pack several PDUs, or the line can be
+   filtered out entirely and yield none). `since` as in parse-tshark."
+  [since line]
+  (for [record [(charred/read-json line :key-fn keyword)]
+        :when (not (:index record))                              ; drop EK bulk-index lines
+        :let [record (update record :timestamp ->long)]
+        :when (or (nil? since) (>= (:timestamp record) since))
+        :when (not= "0" (get-in record [:layers :tcp :tcp_tcp_len])) ; drop Syn/Ack/Fin
+        :let [record (assoc record :protocol (match-protocol record))]
+        :when (:protocol record)
+        :let [record (-> record decode-byte-strings add-payload)]
+        message (split-messages record)]
+    message))
+
+(defn parse-tshark
+  "Turns tshark's JSON-per-line output into raw protocol-message records.
+   `since` (epoch millis, or nil for no cutoff) drops records earlier than it
+   before any of the heavier protocol-matching/byte-decoding steps run, so a
+   log spanning several sessions doesn't pay to process the ones the caller
+   doesn't want.
+
+   Called with just `since`, returns the transducer, for composing into a
+   larger `comp` chain; called with `since` and a seq of lines (e.g.
+   `(line-seq rdr)`), applies it directly and returns the resulting (lazy)
+   seq -- same two-arity convention as `clojure.core/map`/`filter`/etc."
+  ([since] (mapcat (partial parse-line since)))
+  ([since lines] (sequence (parse-tshark since) lines)))
 
 ; Get captured info
 (def tshark-log-file "/tmp/tshark.log")
 (def ports-file (str tshark-log-file ".ports.edn"))
 (def regions-path (str tshark-log-file ".regions.edn"))
+(def since nil) ; epoch millis, e.g. setup's start-all! :since -- nil for no cutoff
+(defn- noise? [event] (#{"pod-coord"} (:key event)))
 ; Parse log
 (def log (with-open [rdr (io/reader tshark-log-file)]
-           (into [] (comp
-                      (map #(charred/read-json % :key-fn keyword))
-                      (remove :index)                       ; drop EK bulk-index lines
-                      (remove (comp #{"0"} :tcp_tcp_len :tcp :layers)) ; drop Syn/Ack/Fin
-                      (map #(assoc % :protocol (match-protocol %)))
-                      (filter :protocol)
-                      (map decode-byte-strings)
-                      (map add-payload)
-                      (mapcat split-messages))
-                 (line-seq rdr))))
+           (->> (line-seq rdr)
+                (parse-tshark since)
+                (filter (comp #{1786745361345} :timestamp))
+                (parse-datomic-traffic)
+                ;(remove-noise noise?)
+                (into []))))
 
 
 (def port-owners (edn/read-string (slurp ports-file)))
-
 (def server-port-names {8000 :dynamodb 11211 :memcache})
-
 (def port-names (merge server-port-names port-owners))
-
-(defn- noise? [event] (#{"pod-coord"} (:key event)))
-(def datomic-parsed-messages
-  (sequence (comp (map extract-fields)
-                  (map decode-body)
-                  (remove-noise noise?))
-            log))
 
 ; Draw the diagram
 (def regions (when (.exists (io/file regions-path))
@@ -334,7 +368,5 @@
 (def protocol-styles
   {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}
    :memcache {:color "#FDFF94" :label "Cache (memcached)"}})
-(diagram/write-svg! datomic-parsed-messages "/tmp/events.svg"
+(diagram/write-svg! log "/tmp/events.svg"
                      {:port-names port-names :regions regions :protocol-styles protocol-styles})
-
-#_(->> log (filter (comp vector? :memcache :layers)))

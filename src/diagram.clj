@@ -84,7 +84,7 @@
 
 (defn- default-label
   [{:keys [operation key status]}]
-  (str (or operation "message")
+  (str operation
        (when key (str " " key))
        (when status (str " " status))))
 
