@@ -84,6 +84,69 @@
 
 (defmulti extract-and-decode-fields :protocol)
 
+(defmulti merge-xform-factory
+  "Zero-arg factory returning a FRESH transducer instance for merging this
+   protocol's decoded events on one stream into logical groups (e.g.
+   Postgres's Parse/Bind/Describe/Execute/Sync collapsed into one event per
+   extended-query round trip) -- see design.txt's \"Splitting and merging
+   messages\". Dispatches on :protocol. :default returns nil, meaning \"no
+   merge, pass this protocol's events through unchanged\"."
+  :protocol)
+(defmethod merge-xform-factory :default [_] nil)
+
+(defn- preserving-reduced
+  "clojure.core has a function with this name (used internally by `cat`), but
+   it's private and only handles the 2-arg step arity, which isn't enough
+   here: this is handed to EACH stream's stepper as ITS rf, and every
+   stream's stepper shares the very same downstream rf underneath. Step (2-
+   arg) calls forward to that shared rf, wrapping any reduced it returns in
+   another reduced so the caller's own reduce (over every stream, in
+   merge-messages-xform) also stops instead of silently unwrapping it.
+   Completion (1-arg), though, is a NO-OP that just returns its result
+   unchanged -- real completion (e.g. into's persistent! on its transient
+   accumulator) must run exactly once, after every stream has flushed, which
+   is merge-messages-xform's own completion's job; if each stream's stepper
+   called all the way through to the shared rf's real completion too, it'd
+   fire once per stream instead of once total."
+  [rf]
+  (fn
+    ([] (rf))
+    ([result] result)
+    ([result event]
+     (let [ret (rf result event)]
+       (if (reduced? ret) (reduced ret) ret)))))
+
+(defn- merge-messages-xform
+  "Applies each event's own protocol's merge-xform-factory, instancing one
+   fresh transducer per stream the first time that stream is seen and
+   reusing it for every later event on it -- so stateful merge logic
+   (partition-by, take-while, a custom stepper, ...) tracks state per
+   stream even though streams interleave in a single pass. Events whose
+   protocol registers no factory pass straight through, unbuffered.
+   Steppers are built over (preserving-reduced rf) so a downstream early
+   termination (e.g. take) still propagates instead of being swallowed.
+   A stream's completion arity (flushing trailing state) only runs at
+   end-of-input, since that's the only reliable per-stream completion
+   signal available in a single pass over one file."
+  [rf]
+  (let [steppers (volatile! {})]
+    (fn
+      ([] (rf))
+      ([result]
+       (let [result (reduce (fn [acc stepper] (if (reduced? acc) acc (stepper acc)))
+                             result (vals @steppers))]
+         (vreset! steppers {})
+         (rf (unreduced result))))
+      ([result event]
+       (if-let [factory (merge-xform-factory event)]
+         (let [stream  (:stream event)
+               stepper (or (get @steppers stream)
+                           (let [s ((factory) (preserving-reduced rf))]
+                             (vswap! steppers assoc stream s)
+                             s))]
+           (stepper result event))
+         (rf result event))))))
+
 (defn tshark-log-xform
   "Transducer parsing raw tshark log lines into decoded event maps. `ports`
    ({port -> protocol-keyword}, e.g. {8000 :dynamodb, 11211 :memcache}) is
@@ -103,7 +166,8 @@
     (map decode-byte-strings)
     (map add-payload)
     (mapcat split-protocol-messages)
-    (map extract-and-decode-fields)))
+    (map extract-and-decode-fields)
+    merge-messages-xform))
 
 (defn read-messages
   "`ports` ({port -> protocol-keyword}) is required and comes first -- it is
