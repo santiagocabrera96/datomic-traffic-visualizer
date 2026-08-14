@@ -231,6 +231,7 @@
   ;;   (process/write-diagram! {:since since :ignore-pod-coord? true})
 
   (require 'process)
+  (process/draw-diagram! "/tmp/tshark.log")
   (process/draw-diagram! (:tshark-log session) {:since (:since session)})
   (def since (System/currentTimeMillis))
   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
