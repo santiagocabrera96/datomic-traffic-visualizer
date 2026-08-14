@@ -227,8 +227,8 @@
   ;; wrapping a call in `region` labels its traffic in events.svg with that
   ;; exact code. Then, once tshark's capture (scripts/capture.sh, run
   ;; beforehand in its own terminal) has what you want:
-  ;;   (require 'process)
-  ;;   (process/write-diagram! {:since since :ignore-pod-coord? true})
+  ;;   (require 'tshark)
+  ;;   (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
 
   ;; A sweep across the rest of the Datomic peer API, so a capture can be
   ;; validated against every shape of traffic the pipeline needs to decode
@@ -279,14 +279,14 @@
   ;; to run one now rather than waiting for its usual schedule, so a capture
   ;; can see the segment-to-memcache writes @alex's note above describes.
   (region (do (d/request-index conn)
-              (Thread/sleep 1000)))
+              (Thread/sleep 3000)))
 
-  (require 'process)
-  (process/draw-diagram! "/tmp/tshark.log")
-  (process/draw-diagram! (:tshark-log session) {:since (:since session)})
+  (require 'tshark)
+  (tshark/draw-diagram! "/tmp/tshark.log")
+  (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
   (def since (System/currentTimeMillis))
   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
-  (process/draw-diagram! (:tshark-log session) {:since since})
+  (tshark/draw-diagram! (:tshark-log session) {:since since})
 
 
   ;; Manual teardown.

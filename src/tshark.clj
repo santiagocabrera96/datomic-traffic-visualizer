@@ -1,24 +1,16 @@
-(set! *print-length* 1000)
-; First we capture information of traffic into a file
-; Then we start our processes: dynamodb, memcache, transactor, and our REPL is the peer
-; Capture info...
-; While capturing, we want to generate a map of ports owners, and a map of regions (label, start, end) times in milliseconds.
-
-; Then, when we process that information, we want to understand known protocols (dynamodb over http/memcache over tcp).
-; Split grouped by messages into individual protocol messages.
-; Then, we need to find bytearrays. Either as 7bit LSB packed string. Or string with format XX:XX:XX:XX
-; We need to add types to each field, specially to know how to decode them.
-; Decode bytearrays, parse edn, etc.
-
-(require '[charred.api :as charred]
-         '[clojure.edn :as edn]
-         '[clojure.java.io :as io]
-         '[clojure.repl :refer :all]
-         '[clojure.repl.deps :refer :all]
-         '[clojure.string :as str]
-         '[clojure.walk :as walk]
-         '[fressian-decode]
-         '[diagram])
+(ns tshark
+  "Turns a tshark capture log into decoded Datomic-traffic events and an SVG
+   sequence diagram -- see draw-diagram!. Understands known protocols
+   (dynamodb over http, memcache over tcp), splits grouped packets into
+   individual protocol messages, decodes bytearrays (7-bit LSB packed
+   strings, or hex strings like \"XX:XX:XX:XX\"), and fressian/edn-decodes
+   their bodies."
+  (:require [charred.api :as charred]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.walk :as walk]
+            [diagram :as diagram]
+            [fressian-decode]))
 
 (def protocols
   {:dynamodb {:port "8000"  :layer :http}
@@ -26,7 +18,7 @@
 
 ; Utils
 (defn- some-vals [m]
-    (into (empty m) (remove (comp nil? val)) m))
+  (into (empty m) (remove (comp nil? val)) m))
 (defn- ->vec [x]
   (cond (nil? x) [] (sequential? x) (vec x) :else [x]))
 (defn match-protocol
@@ -341,30 +333,72 @@
   ([since] (mapcat (partial parse-line since)))
   ([since lines] (sequence (parse-tshark since) lines)))
 
-; Get captured info
-(def tshark-log-file "/tmp/tshark.log")
-(def ports-file (str tshark-log-file ".ports.edn"))
-(def regions-path (str tshark-log-file ".regions.edn"))
-(def since nil) ; epoch millis, e.g. setup's start-all! :since -- nil for no cutoff
-(defn- noise? [event] (#{"pod-coord"} (:key event)))
-; Parse log
-(def log (with-open [rdr (io/reader tshark-log-file)]
-           (->> (line-seq rdr)
-                (parse-tshark since)
-                (parse-datomic-traffic)
-                (remove-noise noise?)
-                (into []))))
+; --- Putting it together: capture file -> decoded events -> SVG diagram ---
 
-
-(def port-owners (edn/read-string (slurp ports-file)))
-(def server-port-names {8000 :dynamodb 11211 :memcache})
-(def port-names (merge server-port-names port-owners))
-
-; Draw the diagram
-(def regions (when (.exists (io/file regions-path))
-               (edn/read-string (slurp regions-path))))
-(def protocol-styles
+(def default-port-names {8000 :dynamodb 11211 :memcache})
+(def default-protocol-styles
   {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}
    :memcache {:color "#FDFF94" :label "Cache (memcached)"}})
-(diagram/write-svg! log "/tmp/events.svg"
-                     {:port-names port-names :regions regions :protocol-styles protocol-styles})
+(defn- default-noisy?
+  "Assumes the transactor's heartbeat/lease traffic is always a PutItem or
+   GetItem on item id \"pod-coord\"."
+  [event]
+  (#{"pod-coord"} (:key event)))
+
+(defn- read-edn-if-exists [path]
+  (when (.exists (io/file path))
+    (edn/read-string (slurp path))))
+
+(defn draw-diagram!
+  "Reads `tshark-log-file` (as captured by scripts/capture.sh, or setup's
+   start-all!), resolves participant names from its sibling *.ports.edn,
+   groups events by its sibling *.regions.edn when present, and writes an
+   SVG sequence diagram. Opts:
+     :svg-path        output path, default tshark-log-file + \".svg\"
+     :since           epoch-millis timestamp (e.g. setup's start-all!
+                      :since) -- events before it are dropped, so a log
+                      spanning several sessions only diagrams the latest one
+     :noisy?          predicate over a request event marking it (and its
+                      paired response) noise to drop -- default drops the
+                      transactor's pod-coord heartbeat; pass e.g. `(constantly
+                      false)` to keep everything
+     :port-names      extra port -> name entries, layered over the sibling
+                      *.ports.edn (and overriding it on conflict) and the
+                      dynamodb/memcache server-port defaults
+     :protocol-styles merged over the default dynamodb/memcache styles
+   Any other opt (e.g. :title, :label-fn) is passed through to
+   diagram/write-svg!."
+  [tshark-log-file & [{:keys [svg-path since noisy? port-names protocol-styles]
+                        :or   {svg-path (str tshark-log-file ".svg")
+                               noisy?   default-noisy?}
+                        :as   opts}]]
+  (let [ports-path      (str tshark-log-file ".ports.edn")
+        regions-path    (str tshark-log-file ".regions.edn")
+        file-port-names (read-edn-if-exists ports-path)
+        regions         (read-edn-if-exists regions-path)
+        events          (with-open [rdr (io/reader tshark-log-file)]
+                          (->> (line-seq rdr)
+                               (parse-tshark since)
+                               (parse-datomic-traffic)
+                               (remove-noise noisy?)
+                               (into [])))]
+    (diagram/write-svg! events svg-path
+                         (merge {:regions regions}
+                                (dissoc opts :svg-path :since :noisy? :port-names :protocol-styles)
+                                {:port-names      (merge default-port-names file-port-names port-names)
+                                 :protocol-styles (merge default-protocol-styles protocol-styles)}))
+    svg-path))
+
+(comment
+  (draw-diagram! "/tmp/tshark.log")
+  (draw-diagram! "/tmp/tshark.log" {:svg-path "/tmp/events.svg"})
+  (draw-diagram! "/tmp/tshark.log" {:noisy? (constantly false)})
+  (draw-diagram! "/tmp/tshark.log" {:port-names {49515 :peer}})
+  (draw-diagram! "/tmp/tshark.log" {:since (- (System/currentTimeMillis) 10000000)})
+
+  ;; The decoded event maps draw-diagram! would otherwise turn straight into
+  ;; an SVG -- handy at the REPL to inspect/filter/tally without generating
+  ;; a diagram at all.
+  (def events (with-open [rdr (io/reader "/tmp/tshark.log")]
+                (->> (line-seq rdr) (parse-tshark nil) (parse-datomic-traffic) (into []))))
+  (frequencies (map :protocol events)))
