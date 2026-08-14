@@ -7,8 +7,8 @@
             [diagram :as diagram]
             [protocol :as proto]))
 (require
-  '[dynamodb]  ; Needed to load dynamodb multimethods
-  '[memcache]) ; Needed to load memcache multimethods
+  '[dynamodb]  ; Needed to load dynamodb multimethods, and for dynamodb/style
+  '[memcache]) ; Needed to load memcache multimethods, and for memcache/style
 
 (set! *print-length* 1000)
 ; First we capture information of traffic into a file
@@ -41,9 +41,10 @@
      :since         epoch-millis timestamp (e.g. setup's start-all!
                      :since) -- events before it are dropped, so a log
                      spanning several sessions only diagrams the latest one
-   Any other opt (e.g. :title, :label-fn) is passed through to
-   diagram/write-svg!, merged under the :port-names/:regions derived here."
-  [tshark-log-file & {:keys [svg-path remove-noise? port-names since]
+   Any other opt (e.g. :title, :label-fn, :protocol-styles) is passed through
+   to diagram/write-svg!, merged under the :port-names/:regions/
+   :protocol-styles derived here."
+  [tshark-log-file & {:keys [svg-path remove-noise? port-names since protocol-styles]
                        :or   {svg-path (str tshark-log-file ".svg")
                               remove-noise? true}
                        :as   opts}]
@@ -53,8 +54,10 @@
                           remove-noise? proto/remove-noise)]
     (diagram/write-svg! events svg-path
                          (merge {:regions regions}
-                                (dissoc opts :svg-path :remove-noise? :port-names :since)
-                                {:port-names (merge file-port-names port-names)}))
+                                (dissoc opts :svg-path :remove-noise? :port-names :since :protocol-styles)
+                                {:port-names      (merge file-port-names port-names)
+                                 :protocol-styles (merge {:dynamodb dynamodb/style :memcache memcache/style}
+                                                         protocol-styles)}))
     svg-path))
 
 (comment

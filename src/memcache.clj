@@ -1,10 +1,9 @@
 (ns memcache
   "Everything specific to the memcache binary protocol: PDU splitting,
    opcode/status lookup tables, and key/body field extraction. Plugs into
-   protocol's multimethods and diagram's protocol-style -- nothing
-   else in the pipeline knows memcache exists."
+   protocol's multimethods -- nothing else in the pipeline knows
+   memcache exists."
   (:require [fressian-decode]
-            [diagram :as diagram]
             [protocol :as proto]))
 
 (defn split-memcache-messages
@@ -86,5 +85,6 @@
     (update fields :body #(some-> % fressian-decode/decode-body))))
 
 ;; Matches the Datomic architecture diagram's own palette: yellow for the
-;; peer's Cache.
-(defmethod diagram/protocol-style :memcache [_] {:color "#FDFF94" :label "Cache (memcached)"})
+;; peer's Cache. Pass under diagram/write-svg!'s :protocol-styles as
+;; {:memcache style}.
+(def style {:color "#FDFF94" :label "Cache (memcached)"})

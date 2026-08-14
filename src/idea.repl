@@ -266,16 +266,15 @@
 (def server-port-names {8000 :dynamodb 11211 :memcache})
 
 (def port-names (merge server-port-names port-owners))
-(defn- attribute [{:keys [srcport dstport] :as m}]
-  (assoc m :from (port-names srcport (keyword (str "unknown-" srcport)))
-           :to   (port-names dstport (keyword (str "unknown-" dstport)))))
-
-(def events (map attribute datomic-parsed-messages))
 
 ; Draw the diagram
 (def regions (when (.exists (io/file regions-path))
                (edn/read-string (slurp regions-path))))
-(diagram/write-svg! events "/tmp/events.svg" {:port-names port-names :regions regions})
+(def protocol-styles
+  {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}
+   :memcache {:color "#FDFF94" :label "Cache (memcached)"}})
+(diagram/write-svg! datomic-parsed-messages "/tmp/events.svg"
+                     {:port-names port-names :regions regions :protocol-styles protocol-styles})
 
 #_(->> log (filter (comp vector? :memcache :layers)))
 

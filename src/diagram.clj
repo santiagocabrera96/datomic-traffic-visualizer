@@ -88,32 +88,21 @@
        (when key (str " " key))
        (when status (str " " status))))
 
-(defmulti protocol-style
-  "Presentation info for `protocol` -- {:color \"#...\" :label \"...\"} used
-   to color that protocol's arrows/notes and to list it in the legend.
-   Dispatches on the protocol keyword itself (not a whole event), so this
-   multimethod's own dispatch table doubles as the registry of known
-   protocols for legend-lines. :default (no entry) means no color and no
-   legend line -- adding a protocol here is the only diagram-side change
-   needed to have it show up styled."
-  identity)
-(defmethod protocol-style :default [_] nil)
-
-(defn- event-color [event]
-  (:color (protocol-style (:protocol event))))
+(defn- event-color [protocol-styles event]
+  (:color (protocol-styles (:protocol event))))
 
 (defn- legend-lines
-  "One `|<back:color>    </back>| label |` row per registered protocol."
-  []
-  (for [proto (remove #{:default} (keys (methods protocol-style)))
-        :let [{:keys [color label]} (protocol-style proto)]]
+  "One `|<back:color>    </back>| label |` row per entry in `protocol-styles`
+   ({protocol -> {:color \"#...\" :label \"...\"}})."
+  [protocol-styles]
+  (for [[_ {:keys [color label]}] protocol-styles]
     (format "|<back:%s>    </back>| %s |" color label)))
 
 (defn- event->plantuml
-  [label-fn event]
+  [label-fn protocol-styles event]
   (let [[from to] (map fmt-participant [(:from event) (:to event)])
         lines     (note-lines event)
-        color     (event-color event)]
+        color     (event-color protocol-styles event)]
     (str/join "\n"
               (remove nil?
                       [(format "\"%s\" -> \"%s\"%s: %s" from to (if color (str " " color) "")
@@ -162,16 +151,21 @@
    missing :from/:to gets them resolved from its :srcport/:dstport via opts'
    :port-names; an event that already has :from/:to is left alone.
 
-   opts: {:title      \"...\"                 diagram title
-          :label-fn   (fn [event] \"...\")    arrow label, defaults to `default-label`
-          :port-names {port -> name}          resolves :srcport/:dstport into
-                       participant names (e.g. setup's port-owners map)
-                       for events missing :from/:to; a port missing from it
-                       renders as :unknown-<port>
-          :regions    [{:label \"...\" :start ms :end ms}]  wraps events whose
-                       :timestamp falls in [:start :end] in `group :label ... end`}"
+   opts: {:title           \"...\"                 diagram title
+          :label-fn        (fn [event] \"...\")    arrow label, defaults to `default-label`
+          :port-names      {port -> name}          resolves :srcport/:dstport into
+                            participant names (e.g. setup's port-owners map)
+                            for events missing :from/:to; a port missing from it
+                            renders as :unknown-<port>
+          :regions         [{:label \"...\" :start ms :end ms}]  wraps events whose
+                            :timestamp falls in [:start :end] in `group :label ... end`
+          :protocol-styles {protocol -> {:color \"#...\" :label \"...\"}}  colors
+                            that protocol's arrows/notes and lists it in the
+                            legend; a protocol missing from it gets no color
+                            and no legend line}"
   ([events] (events->plantuml events nil))
-  ([events {:keys [title label-fn regions port-names] :or {label-fn default-label port-names {}}}]
+  ([events {:keys [title label-fn regions port-names protocol-styles]
+            :or   {label-fn default-label port-names {} protocol-styles {}}}]
    (let [events       (->> events (sort-by :timestamp) (map (partial attach-participants port-names)))
          participants (->> events (mapcat (juxt :from :to)) distinct (map fmt-participant))]
      (str/join "\n"
@@ -181,9 +175,9 @@
                          (when title [(str "title " title)])
                          ["autonumber"]
                          (map #(format "participant \"%s\"" %) participants)
-                         (grouped-lines regions events (map #(event->plantuml label-fn %) events))
-                         (when (seq (legend-lines))
-                           (concat ["legend top left"] (legend-lines) ["endlegend"]))
+                         (grouped-lines regions events (map #(event->plantuml label-fn protocol-styles %) events))
+                         (when (seq (legend-lines protocol-styles))
+                           (concat ["legend top left"] (legend-lines protocol-styles) ["endlegend"]))
                          ["@enduml"]))))))
 
 (defn write-diagram!
@@ -231,12 +225,11 @@
                               :label-fn   (fn [e] (str (:operation e) " " (:key e)))
                               :regions    [{:label "warmup" :start 0 :end 1}]}))
 
-  ;; Coloring/legend: protocol-style is a multimethod, so a new protocol
-  ;; shows up in the legend just by adding a defmethod -- see dynamodb
-  ;; and memcache for the real ones.
-  (defmethod protocol-style :dynamodb [_] {:color "#FFAEFB" :label "Storage (DynamoDB)"})
+  ;; Coloring/legend: pass :protocol-styles -- see dynamodb and memcache for
+  ;; the real ones.
   (println (events->plantuml (map #(assoc % :protocol :dynamodb) raw-events)
-                             {:port-names {8000 :dynamodb}}))
+                             {:port-names      {8000 :dynamodb}
+                              :protocol-styles {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}}}))
 
   ;; Write straight to a .puml source file, or render straight to SVG --
   ;; both take the same opts as events->plantuml.

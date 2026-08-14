@@ -1,14 +1,12 @@
 (ns dynamodb
   "Everything specific to Datomic's DynamoDB traffic: HTTP/JSON request-line
    parsing, AttributeValue unwrapping, and Datomic's own 7-bit-packed
-   gzip+fressian :v blob encoding. Plugs into protocol's multimethods and
-   diagram's protocol-style -- nothing else in the pipeline knows
-   dynamodb exists."
+   gzip+fressian :v blob encoding. Plugs into protocol's multimethods --
+   nothing else in the pipeline knows dynamodb exists."
   (:require [charred.api :as charred]
             [clojure.edn :as edn]
             [clojure.walk :as walk]
             [fressian-decode]
-            [diagram :as diagram]
             [protocol :as proto]))
 
 (defn- dynamo-operation [http]
@@ -123,5 +121,6 @@
   (and (proto/request? e) (= "pod-coord" (:key e))))
 
 ;; Matches the Datomic architecture diagram's own palette: pink for the
-;; Storage Service.
-(defmethod diagram/protocol-style :dynamodb [_] {:color "#FFAEFB" :label "Storage (DynamoDB)"})
+;; Storage Service. Pass under diagram/write-svg!'s :protocol-styles as
+;; {:dynamodb style}.
+(def style {:color "#FFAEFB" :label "Storage (DynamoDB)"})
