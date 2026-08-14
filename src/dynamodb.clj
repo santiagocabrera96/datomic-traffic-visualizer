@@ -44,7 +44,7 @@
   (let [{:keys [tcp http]} layers
         body (parse-dynamo-body (:http_http_file_data http))]
     (proto/some-vals {:protocol       :dynamodb
-                       :timestamp      (proto/->long timestamp)
+                       :timestamp      timestamp
                        :stream         (proto/->long (:tcp_tcp_stream tcp))
                        :srcport        (proto/->long (:tcp_tcp_srcport tcp))
                        :dstport        (proto/->long (:tcp_tcp_dstport tcp))

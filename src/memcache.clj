@@ -61,7 +61,7 @@
           to (+ 24 total)]
       (proto/some-vals
         {:protocol  :memcache
-         :timestamp (proto/->long timestamp)
+         :timestamp timestamp
          :stream    (proto/->long (:tcp_tcp_stream tcp))
          :srcport   (proto/->long (:tcp_tcp_srcport tcp))
          :dstport   (proto/->long (:tcp_tcp_dstport tcp))

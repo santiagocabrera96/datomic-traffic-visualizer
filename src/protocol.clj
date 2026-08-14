@@ -56,12 +56,15 @@
    (epoch millis, or nil for no cutoff) drops records earlier than it before
    any of the heavier protocol-matching/byte-decoding steps run, so a log
    spanning several sessions doesn't pay to process the ones read-messages'
-   caller doesn't want."
+   caller doesn't want. Parses :timestamp to a long once, here -- so
+   downstream extract-and-decode-fields methods (e.g. dynamodb/memcache-fields)
+   can take it as already-a-long instead of each re-parsing it themselves."
   [since]
   (comp
     (map #(charred/read-json % :key-fn keyword))
     (remove :index)                                  ; drop EK bulk-index lines
-    (filter #(or (nil? since) (>= (->long (:timestamp %)) since)))
+    (map #(update % :timestamp ->long))
+    (filter #(or (nil? since) (>= (:timestamp %) since)))
     (remove (comp #{"0"} :tcp_tcp_len :tcp :layers))  ; drop Syn/Ack/Fin
     (map #(assoc % :protocol (match-protocol %)))
     (filter :protocol)
@@ -98,33 +101,43 @@
 (defmethod request? :default [_] false)
 
 (defn remove-noise
-  "Drops noisy request/response pairs. For each event, request? decides
-   whether it's a request; if so, noise? decides whether to drop it, and
-   that verdict is pushed onto a per-stream FIFO queue in `pending` (so a
-   stream with several in-flight requests remembers each one's verdict in
-   order). A non-request event on a stream with a pending queue is treated
-   as that request's response: it pops the oldest verdict off the queue and
-   is dropped iff its paired request was. This assumes responses come back
-   in the same order their requests were sent, per stream (true for
-   HTTP/1.1 keep-alive without pipelining, which is what dynamo-fields'
-   :request-method/:status pairing relies on) -- an event on a stream with
-   no pending queue (e.g. a protocol that never registers a `request?`
-   method) just passes through untouched."
-  [events]
-  (loop [[e & more] events, pending {}, acc (transient [])]
-    (if-not e
-      (persistent! acc)
-      (let [stream (:stream e)]
-        (cond
-          (request? e)
-          (let [drop? (noise? e)]
-            (recur more (update pending stream (fnil conj []) drop?)
-                   (cond-> acc (not drop?) (conj! e))))
+  "Stateful transducer dropping noisy request/response pairs. For each
+   event, request? decides whether it's a request; if so, noise? decides
+   whether to drop it, and that verdict is pushed onto a per-stream FIFO
+   queue in `pending` (so a stream with several in-flight requests
+   remembers each one's verdict in order). A non-request event on a stream
+   with a pending queue is treated as that request's response: it pops the
+   oldest verdict off the queue and is dropped iff its paired request was.
+   This assumes responses come back in the same order their requests were
+   sent, per stream (true for HTTP/1.1 keep-alive without pipelining, which
+   is what dynamo-fields' :request-method/:status pairing relies on) -- an
+   event on a stream with no pending queue (e.g. a protocol that never
+   registers a `request?` method) just passes through untouched. One pass
+   over the seq, no need to hold it all in memory.
 
-          (contains? pending stream)
-          (let [drop? (first (get pending stream))]
-            (recur more (update pending stream (comp vec rest))
-                   (cond-> acc (not drop?) (conj! e))))
+   Called with no args, returns the transducer, for composing into a larger
+   `comp` chain; called with a seq of events, applies it directly and
+   returns the resulting (lazy) seq -- same two-arity convention as
+   `clojure.core/map`/`filter`/etc."
+  ([]
+   (fn [rf]
+     (let [pending (volatile! {})]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result e]
+          (let [stream (:stream e)]
+            (cond
+              (request? e)
+              (let [drop? (boolean (noise? e))]
+                (vswap! pending update stream (fnil conj []) drop?)
+                (if drop? result (rf result e)))
 
-          :else
-          (recur more pending (conj! acc e)))))))
+              (contains? @pending stream)
+              (let [drop? (first (get @pending stream))]
+                (vswap! pending update stream (comp vec rest))
+                (if drop? result (rf result e)))
+
+              :else
+              (rf result e)))))))
+  ([events] (sequence (remove-noise) events)))
