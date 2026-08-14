@@ -17,6 +17,7 @@
          '[clojure.repl.deps :refer :all]
          '[clojure.string :as str]
          '[clojure.walk :as walk]
+         '[fressian-decode]
          '[diagram])
 
 (def protocols
@@ -60,9 +61,122 @@
       (get-in layers [:tcp :tcp_tcp_payload])))
 (defn- add-payload [record]
   (assoc-in record [:layers :tcp :tcp_payload] (reliable-payload (:layers record))))
-
-
 (defn- ->long [x] (when x (parse-long (str x))))
+(defn decode-edn
+  "Parses any string that looks like edn into its value, leaving everything
+   else (including strings that fail to parse) untouched."
+  [x]
+  (walk/postwalk
+    (fn [v]
+      (if (string? v)
+        (let [parsed (try (edn/read-string v) (catch Exception _ v))]
+          (if (coll? parsed) parsed v))
+        v))
+    x))
+
+; --- HTTP layer: generic request/response shape, no dynamo/datomic knowledge ---
+
+(defn- json-body [^bytes body-bytes]
+  (when (and body-bytes (pos? (alength body-bytes)))
+    (try (charred/read-json (String. body-bytes "UTF-8") :key-fn keyword)
+         (catch Exception _ nil))))
+(defn- http-fields
+  "The protocol-agnostic parts of one HTTP request/response: its raw
+   request-line headers (for callers to pick AWS-style X-Amz-* headers out
+   of), status code, and JSON-decoded body -- no AttributeValue-unwrapping
+   or other dynamo-specific shape imposed yet."
+  [http]
+  {:request-method (:http_http_request_method http)
+   :request-line   (->vec (:http_http_request_line http))
+   :status         (->long (:http_http_response_code http))
+   :body           (json-body (:http_http_file_data http))})
+
+; --- DynamoDB specifics: the AWS API shape layered on top of HTTP/JSON ---
+
+(defn- dynamo-operation
+  "DynamoDB's operation name, e.g. \"PutItem\" -- the part of the
+   X-Amz-Target request-line header after the service prefix."
+  [request-line]
+  (some #(second (re-find #"(?i)^X-Amz-Target:\s*\S+\.(\S+)\s*$" (str %)))
+        request-line))
+(defn- attribute-value? [x]
+  (and (map? x) (= 1 (count x))
+       (contains? #{:S :N :B :BOOL :NULL :SS :NS :BS :M :L} (ffirst x))))
+(defn- unwrap-attribute-value [{:keys [S N B BOOL NULL SS NS BS M L] :as av}]
+  (cond
+    S S
+    N N
+    B (.decode (java.util.Base64/getDecoder) ^String B)
+    BOOL BOOL
+    NULL nil
+    SS SS
+    NS NS
+    BS (mapv #(.decode (java.util.Base64/getDecoder) ^String %) BS)
+    M M
+    L L))
+(defn unwrap-attribute-values [x]
+  (walk/postwalk (fn [v] (if (attribute-value? v) (unwrap-attribute-value v) v)) x))
+(defn- dynamo-key [body]
+  (or (get-in body [:Item :id])
+      (get-in body [:Key :id])))
+(defn dynamo-fields
+  [{:keys [timestamp layers]}]
+  (let [{:keys [tcp http]} layers
+        {:keys [request-method request-line status body]} (http-fields http)
+        body (unwrap-attribute-values body)]
+    (some-vals {:protocol       :dynamodb
+                :timestamp      (->long timestamp)
+                :stream         (->long (:tcp_tcp_stream tcp))
+                :srcport        (->long (:tcp_tcp_srcport tcp))
+                :dstport        (->long (:tcp_tcp_dstport tcp))
+                :request-method request-method
+                :operation      (dynamo-operation request-line)
+                :key            (dynamo-key body)
+                :status         status
+                :body           body})))
+
+; --- Datomic-over-DynamoDB specifics: Datomic's own :v blob encoding, on top
+; of dynamo-fields' already-AttributeValue-unwrapped body ---
+
+(defn- ascii7-string? [^String s] (every? #(< (int %) 128) s))
+
+(defn- unpack-7bit-lsb [^String s]
+  (let [n (count s)
+        nbytes (quot (* 7 n) 8)
+        out (byte-array nbytes)]
+    (dotimes [i n]
+      (let [c (long (.charAt s i)) bit-pos (* 7 i)]
+        (dotimes [b 7]
+          (when (bit-test c b)
+            (let [pos (+ bit-pos b) byte-idx (quot pos 8) bit-in-byte (rem pos 8)]
+              (when (< byte-idx nbytes)
+                (aset out byte-idx (unchecked-byte (bit-or (bit-and 0xff (aget out byte-idx))
+                                                           (bit-shift-left 1 bit-in-byte))))))))))
+    out))
+
+(defn decode-dynamo-body
+  "Datomic-specific: decode the 7-bit-packed gzip+fressian (or plain
+   edn-printed) :v blob Datomic's dynamo backend writes into its
+   AttributeValue strings. Takes body already JSON-parsed and
+   AttributeValue-unwrapped (see dynamo-fields)."
+  [body]
+  (when body
+    (walk/postwalk
+      (fn [v]
+        (if (and (string? v) (ascii7-string? v))
+          (let [unpacked (unpack-7bit-lsb v)]
+            (cond
+              (fressian-decode/fressian-body? unpacked)
+              (try (fressian-decode/decode-body unpacked) (catch Exception _ v))
+
+              :else
+              (let [parsed (some-> (String. unpacked)
+                                   (as-> text (try (edn/read-string text) (catch Exception _ nil))))]
+                (if (coll? parsed) parsed v))))
+          v))
+      body)))
+
+; --- memcache: PDU splitting, opcode/status lookup tables, field extraction ---
 
 (defn split-memcache-messages
   "One tshark packet record, possibly carrying several memcache PDUs packed
@@ -87,51 +201,6 @@
                      (+ offset pdu-len)]))
                 [[] 0]
                 ms)))))
-
-(defn- dynamo-operation [http]
-  (some #(second (re-find #"(?i)^X-Amz-Target:\s*\S+\.(\S+)\s*$" (str %)))
-        (->vec (:http_http_request_line http))))
-
-(defn- attribute-value? [x]
-  (and (map? x) (= 1 (count x))
-       (contains? #{:S :N :B :BOOL :NULL :SS :NS :BS :M :L} (ffirst x))))
-
-(defn- unwrap-attribute-value [{:keys [S N B BOOL NULL SS NS BS M L] :as av}]
-  (cond
-    S S
-    N N
-    B (.decode (java.util.Base64/getDecoder) ^String B)
-    BOOL BOOL
-    NULL nil
-    SS SS
-    NS NS
-    BS (mapv #(.decode (java.util.Base64/getDecoder) ^String %) BS)
-    M M
-    L L))
-(defn unwrap-attribute-values [x]
-  (walk/postwalk (fn [v] (if (attribute-value? v) (unwrap-attribute-value v) v)) x))
-(defn- parse-dynamo-body [^bytes body-bytes]
-  (when (and body-bytes (pos? (alength body-bytes)))
-    (some-> (try (charred/read-json (String. body-bytes "UTF-8") :key-fn keyword)
-                 (catch Exception _ nil))
-            unwrap-attribute-values)))
-(defn- dynamo-key [body]
-  (or (get-in body [:Item :id])
-      (get-in body [:Key :id])))
-(defn dynamo-fields
-  [{:keys [timestamp layers]}]
-  (let [{:keys [tcp http]} layers
-        body (parse-dynamo-body (:http_http_file_data http))]
-    (some-vals {:protocol       :dynamodb
-                :timestamp      (->long timestamp)
-                :stream         (->long (:tcp_tcp_stream tcp))
-                :srcport        (->long (:tcp_tcp_srcport tcp))
-                :dstport        (->long (:tcp_tcp_dstport tcp))
-                :request-method (:http_http_request_method http)
-                :operation      (dynamo-operation http)
-                :key            (dynamo-key body)
-                :status         (->long (:http_http_response_code http))
-                :body           body})))
 
 (def opcode->command
   {0x00 :get 0x01 :set 0x02 :add 0x03 :replace 0x04 :delete 0x05 :incr 0x06 :decr
@@ -182,55 +251,6 @@
     :memcache (split-memcache-messages m)
     [m]))
 
-; --- dynamo body decode ---
-
-(defn- ascii7-string? [^String s] (every? #(< (int %) 128) s))
-
-(defn- unpack-7bit-lsb [^String s]
-  (let [n (count s)
-        nbytes (quot (* 7 n) 8)
-        out (byte-array nbytes)]
-    (dotimes [i n]
-      (let [c (long (.charAt s i)) bit-pos (* 7 i)]
-        (dotimes [b 7]
-          (when (bit-test c b)
-            (let [pos (+ bit-pos b) byte-idx (quot pos 8) bit-in-byte (rem pos 8)]
-              (when (< byte-idx nbytes)
-                (aset out byte-idx (unchecked-byte (bit-or (bit-and 0xff (aget out byte-idx))
-                                                           (bit-shift-left 1 bit-in-byte))))))))))
-    out))
-
-(defn decode-dynamo-body
-  "Datomic-specific: decode the 7-bit-packed gzip+fressian (or plain
-   edn-printed) :v blob Datomic's dynamo backend writes into its
-   AttributeValue strings. Takes body already JSON-parsed and
-   AttributeValue-unwrapped (see dynamo-fields)."
-  [body]
-  (when body
-    (walk/postwalk
-      (fn [v]
-        (if (and (string? v) (ascii7-string? v))
-          (let [unpacked (unpack-7bit-lsb v)]
-            (cond
-              (fressian-decode/fressian-body? unpacked)
-              (try (fressian-decode/decode-body unpacked) (catch Exception _ v))
-
-              :else
-              (let [parsed (some-> (String. unpacked)
-                                   (as-> text (try (edn/read-string text) (catch Exception _ nil))))]
-                (if (coll? parsed) parsed v))))
-          v))
-      body)))
-(defn decode-edn
-  [x]
-  (walk/postwalk
-    (fn [v]
-      (if (string? v)
-        (let [parsed (try (edn/read-string v) (catch Exception _ v))]
-          (if (coll? parsed) parsed v))
-        v))
-    x))
-
 ; Get captured info
 (def tshark-log-file "/tmp/tshark.log")
 (def ports-file (str tshark-log-file ".ports.edn"))
@@ -277,4 +297,3 @@
                      {:port-names port-names :regions regions :protocol-styles protocol-styles})
 
 #_(->> log (filter (comp vector? :memcache :layers)))
-
