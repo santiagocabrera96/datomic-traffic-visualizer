@@ -30,16 +30,7 @@
   "Reads `tshark-log-file` (as captured by scripts/capture.sh/setup's
    start-all!), resolves participant names from its sibling *.ports.edn,
    groups events by its sibling *.regions.edn when present, and writes an SVG
-   sequence diagram.
-
-   `ports` ({port -> protocol-keyword}, e.g. {8000 :dynamodb, 11211
-   :memcache}) is mandatory and positional -- it's passed straight through
-   to protocol/read-messages to identify traffic by port. It's positional
-   (not a keyword opt) precisely so it can't be silently omitted: only the
-   caller knows what's actually listening on which port for a given
-   capture, so there's no sane default to fall back to.
-
-   Remaining opts:
+   sequence diagram. Remaining opts:
      :svg-path      output path, default tshark-log-file + \".svg\"
      :remove-noise? drop noisy requests (e.g. dynamo's pod-coord heartbeat)
                      via protocol/remove-noise, default true
@@ -52,13 +43,13 @@
                      spanning several sessions only diagrams the latest one
    Any other opt (e.g. :title, :label-fn) is passed through to
    diagram/write-svg!, merged under the :port-names/:regions derived here."
-  [ports tshark-log-file & {:keys [svg-path remove-noise? port-names since]
-                             :or   {svg-path (str tshark-log-file ".svg")
-                                    remove-noise? true}
-                             :as   opts}]
+  [tshark-log-file & {:keys [svg-path remove-noise? port-names since]
+                       :or   {svg-path (str tshark-log-file ".svg")
+                              remove-noise? true}
+                       :as   opts}]
   (let [file-port-names (read-edn-if-exists (str tshark-log-file ".ports.edn"))
         regions         (read-edn-if-exists (str tshark-log-file ".regions.edn"))
-        events          (cond-> (proto/read-messages ports tshark-log-file since)
+        events          (cond-> (proto/read-messages tshark-log-file since)
                           remove-noise? proto/remove-noise)]
     (diagram/write-svg! events svg-path
                          (merge {:regions regions}
@@ -67,17 +58,9 @@
     svg-path))
 
 (comment
-  (def ports {8000 :dynamodb, 11211 :memcache})
-  (draw-diagram! ports "/tmp/tshark.log")
-  (draw-diagram! ports "/tmp/tshark.log" :svg-path "/tmp/events.svg")
-  (draw-diagram! ports "/tmp/tshark.log" :remove-noise? false)
-  (draw-diagram! ports "/tmp/tshark.log" :port-names {49515 :peer})
-  (draw-diagram! (assoc ports 5432 :dynamodb) "/tmp/tshark.log")
-  (draw-diagram! ports "/tmp/tshark.log" :since (- (System/currentTimeMillis) 10000000))
-  (draw-diagram! ports "/tmp/tshark.log" :svg-path "/tmp/events.svg" :title "Demo")
-
-  ;; Validate http.clj's decoding directly: map 8000 to :http instead of
-  ;; :dynamodb, so every dynamo message renders as raw HTTP (method/uri,
-  ;; headers, content-type-decoded body) instead of going through dynamodb's
-  ;; AWS-API-shape extraction.
-  (draw-diagram! {8000 :http} "/tmp/tshark.log" :svg-path "/tmp/http-check.svg"))
+  (draw-diagram! "/tmp/tshark.log")
+  (draw-diagram! "/tmp/tshark.log" :svg-path "/tmp/events.svg")
+  (draw-diagram! "/tmp/tshark.log" :remove-noise? false)
+  (draw-diagram! "/tmp/tshark.log" :port-names {49515 :peer})
+  (draw-diagram! "/tmp/tshark.log" :since (- (System/currentTimeMillis) 10000000))
+  (draw-diagram! "/tmp/tshark.log" :svg-path "/tmp/events.svg" :title "Demo"))

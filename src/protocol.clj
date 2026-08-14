@@ -36,150 +36,45 @@
   (assoc-in record [:layers :tcp :tcp_payload] (reliable-payload (:layers record))))
 
 (defmulti protocol-matches?
-  "Does `record` belong to `proto`, given that `proto` already owns one of
-   record's ports (per the caller-supplied ports map)? Dispatches on proto
-   itself, so each protocol only has to confirm that tshark actually
-   dissected its layer out of this record (e.g. :http present for
-   :dynamodb) -- not re-check the port, which match-protocol already used
-   to narrow the candidates."
+  "Does `record` belong to `proto`? Dispatches on proto itself, so each
+   protocol owns its own matching rule instead of going through one shared
+   port+layer check."
   (fn [proto _record] proto))
 
-(defn- record-ports
-  "The record's own port(s), as ints -- tshark's tcp.port is a pseudo-field
-   matching either direction, so this is usually a 1- or 2-element set."
-  [record]
-  (into #{} (keep ->long) (->vec (get-in record [:layers :tcp :tcp_tcp_port]))))
-
-(defn validate-ports!
-  "Throws if `ports` (a {port -> protocol-keyword} map) names a protocol
-   keyword nothing registered a protocol-matches? method for. Called once,
-   up front, so a typo in the ports map fails with one clear message
-   instead of a bare multimethod dispatch exception on the first matching
-   record deep in the log."
-  [ports]
-  (let [known   (set (keys (methods protocol-matches?)))
-        unknown (remove known (vals ports))]
-    (when (seq unknown)
-      (throw (ex-info (str "Unknown protocol(s) in ports map: " (vec unknown)
-                            " -- registered protocols are " known)
-                       {:unknown unknown :known known})))))
-
 (defn match-protocol
-  "Looks up record's own port(s) in `ports` ({port -> protocol-keyword}) to
-   get the protocol(s) that own one of them, then confirms with
-   protocol-matches?. Throws if more than one protocol matches -- ambiguous
-   port ownership is a configuration bug to surface loudly, not something
-   to silently break a tie on by hash-map iteration order."
-  [ports record]
-  (let [candidates (into #{} (keep ports) (record-ports record))
-        matches    (filterv #(protocol-matches? % record) candidates)]
-    (case (count matches)
-      0 nil
-      1 (first matches)
-      (throw (ex-info (str "Ambiguous protocol match -- record matches more than one protocol: " matches)
-                       {:candidates matches :record record})))))
+  "First registered protocol (via protocol-matches?) that record matches."
+  [record]
+  (some #(when (protocol-matches? % record) %) (keys (methods protocol-matches?))))
 
 (defmulti split-protocol-messages :protocol)
 (defmethod split-protocol-messages :default [m] [m])
 
 (defmulti extract-and-decode-fields :protocol)
 
-(defmulti merge-xform-factory
-  "Zero-arg factory returning a FRESH transducer instance for merging this
-   protocol's decoded events on one stream into logical groups (e.g.
-   Postgres's Parse/Bind/Describe/Execute/Sync collapsed into one event per
-   extended-query round trip) -- see design.txt's \"Splitting and merging
-   messages\". Dispatches on :protocol. :default returns nil, meaning \"no
-   merge, pass this protocol's events through unchanged\"."
-  :protocol)
-(defmethod merge-xform-factory :default [_] nil)
-
-(defn- preserving-reduced
-  "clojure.core has a function with this name (used internally by `cat`), but
-   it's private and only handles the 2-arg step arity, which isn't enough
-   here: this is handed to EACH stream's stepper as ITS rf, and every
-   stream's stepper shares the very same downstream rf underneath. Step (2-
-   arg) calls forward to that shared rf, wrapping any reduced it returns in
-   another reduced so the caller's own reduce (over every stream, in
-   merge-messages-xform) also stops instead of silently unwrapping it.
-   Completion (1-arg), though, is a NO-OP that just returns its result
-   unchanged -- real completion (e.g. into's persistent! on its transient
-   accumulator) must run exactly once, after every stream has flushed, which
-   is merge-messages-xform's own completion's job; if each stream's stepper
-   called all the way through to the shared rf's real completion too, it'd
-   fire once per stream instead of once total."
-  [rf]
-  (fn
-    ([] (rf))
-    ([result] result)
-    ([result event]
-     (let [ret (rf result event)]
-       (if (reduced? ret) (reduced ret) ret)))))
-
-(defn- merge-messages-xform
-  "Applies each event's own protocol's merge-xform-factory, instancing one
-   fresh transducer per stream the first time that stream is seen and
-   reusing it for every later event on it -- so stateful merge logic
-   (partition-by, take-while, a custom stepper, ...) tracks state per
-   stream even though streams interleave in a single pass. Events whose
-   protocol registers no factory pass straight through, unbuffered.
-   Steppers are built over (preserving-reduced rf) so a downstream early
-   termination (e.g. take) still propagates instead of being swallowed.
-   A stream's completion arity (flushing trailing state) only runs at
-   end-of-input, since that's the only reliable per-stream completion
-   signal available in a single pass over one file."
-  [rf]
-  (let [steppers (volatile! {})]
-    (fn
-      ([] (rf))
-      ([result]
-       (let [result (reduce (fn [acc stepper] (if (reduced? acc) acc (stepper acc)))
-                             result (vals @steppers))]
-         (vreset! steppers {})
-         (rf (unreduced result))))
-      ([result event]
-       (if-let [factory (merge-xform-factory event)]
-         (let [stream  (:stream event)
-               stepper (or (get @steppers stream)
-                           (let [s ((factory) (preserving-reduced rf))]
-                             (vswap! steppers assoc stream s)
-                             s))]
-           (stepper result event))
-         (rf result event))))))
-
 (defn tshark-log-xform
-  "Transducer parsing raw tshark log lines into decoded event maps. `ports`
-   ({port -> protocol-keyword}, e.g. {8000 :dynamodb, 11211 :memcache}) is
-   the sole source of protocol identity by port -- see match-protocol.
-   `since` (epoch millis, or nil for no cutoff) drops records earlier than
-   it before any of the heavier protocol-matching/byte-decoding steps run,
-   so a log spanning several sessions doesn't pay to process the ones
-   read-messages' caller doesn't want."
-  [ports since]
+  "Transducer parsing raw tshark log lines into decoded event maps. `since`
+   (epoch millis, or nil for no cutoff) drops records earlier than it before
+   any of the heavier protocol-matching/byte-decoding steps run, so a log
+   spanning several sessions doesn't pay to process the ones read-messages'
+   caller doesn't want."
+  [since]
   (comp
     (map #(charred/read-json % :key-fn keyword))
     (remove :index)                                  ; drop EK bulk-index lines
     (filter #(or (nil? since) (>= (->long (:timestamp %)) since)))
     (remove (comp #{"0"} :tcp_tcp_len :tcp :layers))  ; drop Syn/Ack/Fin
-    (map #(assoc % :protocol (match-protocol ports %)))
+    (map #(assoc % :protocol (match-protocol %)))
     (filter :protocol)
     (map decode-byte-strings)
     (map add-payload)
     (mapcat split-protocol-messages)
-    (map extract-and-decode-fields)
-    merge-messages-xform))
+    (map extract-and-decode-fields)))
 
 (defn read-messages
-  "`ports` ({port -> protocol-keyword}) is required and comes first -- it is
-   the sole source of protocol identity by port, and its values are
-   validated eagerly against the registered protocols (see validate-ports!)
-   before any of the log is read. `since` (epoch millis) is optional; nil
-   (or omitted) means no cutoff."
-  ([ports tshark-log-file] (read-messages ports tshark-log-file nil))
-  ([ports tshark-log-file since]
-   (validate-ports! ports)
+  ([tshark-log-file] (read-messages tshark-log-file nil))
+  ([tshark-log-file since]
    (with-open [rdr (io/reader tshark-log-file)]
-     (into [] (tshark-log-xform ports since) (line-seq rdr)))))
+     (into [] (tshark-log-xform since) (line-seq rdr)))))
 
 (defmulti noise?
           "Is `event` (a request) traffic worth dropping from the diagram?
@@ -202,93 +97,34 @@
           :protocol)
 (defmethod request? :default [_] false)
 
-(defmulti correlation-id
-  "Per-stream token pairing a request with its response, used by
-   remove-noise. Dispatches on :protocol. :default returns nil, meaning
-   \"no real wire-level token -- tag-correlation-ids should fall back to a
-   per-stream auto-incrementing counter instead\", which matches the old
-   FIFO-queue assumption exactly (responses come back in the order their
-   requests were sent). A protocol with a real correlation token (e.g.
-   memcache's opaque field) overrides this to return it directly, so
-   out-of-order responses or multiplexed exchanges on one stream still pair
-   correctly -- see tag-correlation-ids."
-  :protocol)
-(defmethod correlation-id :default [_] nil)
-
-(defn- tag-correlation-ids
-  "Assigns :correlation-id to every event. When correlation-id returns
-   non-nil for an event, that's used directly (both the request and its
-   response resolve to the same real token, independent of ordering). When
-   it returns nil (the :default case), falls back to a per-stream counter:
-   the Nth request on a stream gets counter N, and the next non-request
-   event on that stream that hasn't already resolved to an explicit token
-   is assumed to be its response and gets N too -- the FIFO order
-   assumption remove-noise previously implemented directly, now expressed
-   as id generation instead of a verdict queue."
+(defn remove-noise
+  "Drops noisy request/response pairs. For each event, request? decides
+   whether it's a request; if so, noise? decides whether to drop it, and
+   that verdict is pushed onto a per-stream FIFO queue in `pending` (so a
+   stream with several in-flight requests remembers each one's verdict in
+   order). A non-request event on a stream with a pending queue is treated
+   as that request's response: it pops the oldest verdict off the queue and
+   is dropped iff its paired request was. This assumes responses come back
+   in the same order their requests were sent, per stream (true for
+   HTTP/1.1 keep-alive without pipelining, which is what dynamo-fields'
+   :request-method/:status pairing relies on) -- an event on a stream with
+   no pending queue (e.g. a protocol that never registers a `request?`
+   method) just passes through untouched."
   [events]
-  (loop [[e & more] events, counters {}, pending {}, acc (transient [])]
+  (loop [[e & more] events, pending {}, acc (transient [])]
     (if-not e
       (persistent! acc)
-      (let [stream   (:stream e)
-            explicit (correlation-id e)]
+      (let [stream (:stream e)]
         (cond
-          (some? explicit)
-          (recur more counters pending (conj! acc (assoc e :correlation-id explicit)))
-
           (request? e)
-          (let [n (inc (get counters stream 0))]
-            (recur more (assoc counters stream n)
-                   (update pending stream (fnil conj []) n)
-                   (conj! acc (assoc e :correlation-id n))))
+          (let [drop? (noise? e)]
+            (recur more (update pending stream (fnil conj []) drop?)
+                   (cond-> acc (not drop?) (conj! e))))
 
-          (seq (get pending stream))
-          (let [id (first (get pending stream))]
-            (recur more counters (update pending stream (comp vec rest))
-                   (conj! acc (assoc e :correlation-id id))))
+          (contains? pending stream)
+          (let [drop? (first (get pending stream))]
+            (recur more (update pending stream (comp vec rest))
+                   (cond-> acc (not drop?) (conj! e))))
 
           :else
-          (recur more counters pending (conj! acc (assoc e :correlation-id nil))))))))
-
-(defn remove-noise
-  "Drops noisy request/response pairs, paired up by (:stream
-   :correlation-id) -- see tag-correlation-ids for how that id is
-   assigned. For each request, noise? decides whether to drop it; every
-   other event sharing its (stream, id) is dropped alongside it. An event
-   whose (stream, id) never matches a request's (e.g. a protocol that never
-   registers request?, or an orphan response) just passes through
-   untouched."
-  [events]
-  (let [tagged   (tag-correlation-ids events)
-        dropped? (into #{}
-                        (comp (filter request?) (filter noise?) (map (juxt :stream :correlation-id)))
-                        tagged)]
-    (into [] (remove (comp dropped? (juxt :stream :correlation-id))) tagged)))
-
-(comment
-  ;; require the protocols you want registered -- read-messages only knows
-  ;; about protocols whose namespace has been loaded (their defmethods run
-  ;; as a side effect of loading), same as process/draw-diagram!'s own
-  ;; `(require '[dynamodb] '[memcache])`.
-  (require '[dynamodb] '[memcache] '[http])
-
-  (def ports {8000 :dynamodb, 11211 :memcache})
-
-  ;; The decoded event maps draw-diagram! would otherwise turn straight into
-  ;; an SVG -- handy at the REPL to inspect/filter/tally without generating
-  ;; a diagram at all.
-  (def events (read-messages (assoc ports 8000 :http) "/tmp/tshark.log"))
-  (count events)
-  (frequencies (map :protocol events))
-  (first (filter #(= :dynamodb (:protocol %)) events))
-
-  ;; `since` (e.g. setup's start-all!/region timestamps) drops earlier
-  ;; records before any protocol-matching/decoding runs.
-  (read-messages ports "/tmp/tshark.log" (- (System/currentTimeMillis) 60000))
-
-  ;; remove-noise is the same request/response-pairing pass draw-diagram!
-  ;; applies by default (its :remove-noise? true).
-  (count (remove-noise events))
-
-  ;; Point a port straight at :http (see http.clj's ns docstring) to inspect
-  ;; raw decoded HTTP instead of a protocol built on top of it.
-  (read-messages {8000 :http} "/tmp/tshark.log"))
+          (recur more pending (conj! acc e)))))))
