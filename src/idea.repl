@@ -135,6 +135,12 @@
                 :status         status
                 :body           body})))
 
+(def dynamo-port 8000)
+(defn- dynamo-request? [event] (= dynamo-port (:dstport event)))
+; Assumes the transactor's heartbeat/lease traffic is always a PutItem or
+; GetItem on item id "pod-coord" -- see README's "Known item shapes".
+(defn- dynamo-noise? [event] (and (dynamo-request? event) (= "pod-coord" (:key event))))
+
 ; --- Datomic-over-DynamoDB specifics: Datomic's own :v blob encoding, on top
 ; of dynamo-fields' already-AttributeValue-unwrapped body ---
 
@@ -268,24 +274,72 @@
                       (mapcat split-messages))
                  (line-seq rdr))))
 
-(def fields
-  (map #(case (:protocol %)
-          :dynamodb (dynamo-fields %)
-          :memcache (memcache-fields %))
-       log))
+(defn- extract-fields [m]
+  (case (:protocol m)
+    :dynamodb (dynamo-fields m)
+    :memcache (memcache-fields m)))
 (defn decode-body [{:keys [protocol body] :as m}]
   (assoc m :body
            (case protocol
              :dynamodb (decode-edn (decode-dynamo-body body))
              :memcache (some-> body fressian-decode/decode-body))))
-(def datomic-parsed-messages
-  (mapv decode-body fields))
 
 (def port-owners (edn/read-string (slurp ports-file)))
 
 (def server-port-names {8000 :dynamodb 11211 :memcache})
 
 (def port-names (merge server-port-names port-owners))
+
+; Drop noisy request/response pairs (e.g. dynamo's pod-coord heartbeat).
+; request?/noise? dispatch per :protocol -- pairing/dropping themselves stay
+; protocol-agnostic.
+(defn- request? [event] (case (:protocol event) :dynamodb (dynamo-request? event) false))
+(defn- noise? [event] (case (:protocol event) :dynamodb (dynamo-noise? event) false))
+
+(defn tag-correlation-ids
+  "Stateful transducer: pairs each stream's requests with their responses via
+   a per-stream FIFO queue (so a stream with several in-flight requests
+   remembers each one in order), tagging both sides of a pair with a shared
+   :correlation-id -- one pass over the seq, no need to hold it all in
+   memory. Assumes responses come back in the same order their requests were
+   sent, per stream, and that events arrive already in timestamp order (true
+   of a tshark log). An event that's neither a request nor a paired response
+   is left untagged.
+
+   noise? only ever depends on the request side of a pair (e.g. dynamo's
+   pod-coord heartbeat is identifiable from the request alone), so that
+   verdict is decided once, here, at request time, and carried forward onto
+   the paired response as :noise? -- downstream noise-removal is then a
+   plain, stateless `(remove :noise? ...)`."
+  []
+  (fn [rf]
+    (let [pending (volatile! {})
+          next-id (volatile! 0)]
+      (fn
+        ([] (rf))
+        ([result] (rf result))
+        ([result e]
+         (let [stream (:stream e)]
+           (cond
+             (request? e)
+             (let [id (vswap! next-id inc) noisy? (noise? e)]
+               (vswap! pending update stream (fnil conj []) {:id id :noisy? noisy?})
+               (rf result (assoc e :correlation-id id :noise? noisy?)))
+
+             (contains? @pending stream)
+             (let [{:keys [id noisy?]} (first (get @pending stream))]
+               (vswap! pending update stream (comp vec rest))
+               (rf result (assoc e :correlation-id id :noise? noisy?)))
+
+             :else
+             (rf result e))))))))
+
+(def datomic-parsed-messages
+  (sequence (comp (map extract-fields)
+                  (map decode-body)
+                  (tag-correlation-ids)
+                  (remove :noise?))
+            log))
 
 ; Draw the diagram
 (def regions (when (.exists (io/file regions-path))
