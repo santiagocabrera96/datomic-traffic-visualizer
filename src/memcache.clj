@@ -68,6 +68,7 @@
          :dstport   (proto/->long (:tcp_tcp_dstport tcp))
          :operation (opcode->command (proto/->long (:memcache_memcache_opcode memcache)) :unknown)
          :status    (status->outcome (proto/->long (:memcache_memcache_status memcache)))
+         :opaque    (proto/->long (:memcache_memcache_opaque memcache))
          :key       (:memcache_memcache_key memcache)
          :body      (when (and payload-bytes
                                (< from to)
@@ -78,8 +79,12 @@
 (defmethod proto/split-protocol-messages :memcache [m] (split-memcache-messages m))
 
 (defmethod proto/protocol-matches? :memcache [_ record]
-  (and (contains? (set (proto/->vec (get-in record [:layers :tcp :tcp_tcp_port]))) "11211")
-       (contains? (:layers record) :memcache)))
+  (contains? (:layers record) :memcache))
+
+;; memcache's binary protocol echoes a client-chosen opaque value back on
+;; the matching response -- a real wire-level correlation token, so
+;; remove-noise doesn't need to fall back to assuming in-order responses.
+(defmethod proto/correlation-id :memcache [e] (:opaque e))
 
 (defmethod proto/extract-and-decode-fields :memcache [m]
   (let [fields (memcache-fields m)]

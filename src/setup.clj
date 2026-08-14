@@ -231,10 +231,12 @@
   ;;   (process/write-diagram! {:since since :ignore-pod-coord? true})
 
   (require 'process)
-  (process/draw-diagram! (:tshark-log session) {:since (:since session)})
+  (def ports {8000 :dynamodb, 11211 :memcache})
+  (process/draw-diagram! ports "/tmp/tshark.log" {:port-names {55675 :transactor}})
+  (process/draw-diagram! ports (:tshark-log session) {:since (:since session)})
   (def since (System/currentTimeMillis))
   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
-  (process/draw-diagram! (:tshark-log session) {:since since})
+  (process/draw-diagram! ports (:tshark-log session) {:since since})
 
   ; From @alex: Transactor will go put segments in memcache before announcing that an indexing job happened.
 

@@ -90,12 +90,11 @@
 
 (defmulti protocol-style
   "Presentation info for `protocol` -- {:color \"#...\" :label \"...\"} used
-   to color that protocol's arrows/notes and to list it in the legend.
-   Dispatches on the protocol keyword itself (not a whole event), so this
-   multimethod's own dispatch table doubles as the registry of known
-   protocols for legend-lines. :default (no entry) means no color and no
-   legend line -- adding a protocol here is the only diagram-side change
-   needed to have it show up styled."
+   to color that protocol's arrows/notes and (for protocols actually present
+   in the events being rendered, see legend-lines) to list it in the legend.
+   Dispatches on the protocol keyword itself (not a whole event). :default
+   (no entry) means no color and no legend line -- adding a protocol here is
+   the only diagram-side change needed to have it show up styled."
   identity)
 (defmethod protocol-style :default [_] nil)
 
@@ -103,10 +102,14 @@
   (:color (protocol-style (:protocol event))))
 
 (defn- legend-lines
-  "One `|<back:color>    </back>| label |` row per registered protocol."
-  []
-  (for [proto (remove #{:default} (keys (methods protocol-style)))
-        :let [{:keys [color label]} (protocol-style proto)]]
+  "One `|<back:color>    </back>| label |` row per protocol actually present
+   in `events` (not every registered protocol -- a diagram scoped to one
+   protocol, e.g. via ports mapping everything to :http, shouldn't list
+   :dynamodb/:memcache too just because they happen to be registered)."
+  [events]
+  (for [proto (->> events (keep :protocol) distinct sort)
+        :let [{:keys [color label]} (protocol-style proto)]
+        :when color]
     (format "|<back:%s>    </back>| %s |" color label)))
 
 (defn- event->plantuml
@@ -182,8 +185,8 @@
                          ["autonumber"]
                          (map #(format "participant \"%s\"" %) participants)
                          (grouped-lines regions events (map #(event->plantuml label-fn %) events))
-                         (when (seq (legend-lines))
-                           (concat ["legend top left"] (legend-lines) ["endlegend"]))
+                         (when (seq (legend-lines events))
+                           (concat ["legend top left"] (legend-lines events) ["endlegend"]))
                          ["@enduml"]))))))
 
 (defn write-diagram!

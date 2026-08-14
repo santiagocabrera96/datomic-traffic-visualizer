@@ -1,19 +1,23 @@
 (ns dynamodb
-  "Everything specific to Datomic's DynamoDB traffic: HTTP/JSON request-line
-   parsing, AttributeValue unwrapping, and Datomic's own 7-bit-packed
-   gzip+fressian :v blob encoding. Plugs into protocol's multimethods and
-   diagram's protocol-style -- nothing else in the pipeline knows
-   dynamodb exists."
-  (:require [charred.api :as charred]
-            [clojure.edn :as edn]
+  "Everything specific to Datomic's DynamoDB traffic: AWS-API-shape
+   extraction on top of the generic http layer, AttributeValue unwrapping,
+   and Datomic's own 7-bit-packed gzip+fressian :v blob encoding. Plugs
+   into protocol's multimethods and diagram's protocol-style -- nothing
+   else in the pipeline knows dynamodb exists."
+  (:require [clojure.edn :as edn]
             [clojure.walk :as walk]
             [fressian-decode]
             [diagram :as diagram]
+            [http :as http]
             [protocol :as proto]))
 
-(defn- dynamo-operation [http]
-  (some #(second (re-find #"(?i)^X-Amz-Target:\s*\S+\.(\S+)\s*$" (str %)))
-        (proto/->vec (:http_http_request_line http))))
+(defn- dynamo-operation
+  "DynamoDB's operation name, e.g. \"PutItem\" -- the part of the
+   X-Amz-Target header after the service prefix (\"DynamoDB_20120810.\")."
+  [headers]
+  (some->> (get headers "x-amz-target")
+           (re-find #"(?i)\S+\.(\S+)\s*$")
+           second))
 
 (defn- attribute-value? [x]
   (and (map? x) (= 1 (count x))
@@ -33,26 +37,22 @@
     L L))
 (defn unwrap-attribute-values [x]
   (walk/postwalk (fn [v] (if (attribute-value? v) (unwrap-attribute-value v) v)) x))
-(defn- parse-dynamo-body [^bytes body-bytes]
-  (when (and body-bytes (pos? (alength body-bytes)))
-    (some-> (try (charred/read-json (String. body-bytes "UTF-8") :key-fn keyword)
-                 (catch Exception _ nil))
-            unwrap-attribute-values)))
 (defn- dynamo-key [body]
   (or (get-in body [:Item :id])
       (get-in body [:Key :id])))
 (defn dynamo-fields
-  [{:keys [timestamp layers]}]
-  (let [{:keys [tcp http]} layers
-        body (parse-dynamo-body (:http_http_file_data http))]
+  [{:keys [timestamp layers] :as record}]
+  (let [{:keys [tcp]} layers
+        {:keys [headers status body]} (http/http-fields record)
+        body (some-> body unwrap-attribute-values)]
     (proto/some-vals {:protocol       :dynamodb
                        :timestamp      (proto/->long timestamp)
                        :stream         (proto/->long (:tcp_tcp_stream tcp))
                        :srcport        (proto/->long (:tcp_tcp_srcport tcp))
                        :dstport        (proto/->long (:tcp_tcp_dstport tcp))
-                       :operation      (dynamo-operation http)
+                       :operation      (dynamo-operation headers)
                        :key            (dynamo-key body)
-                       :status         (proto/->long (:http_http_response_code http))
+                       :status         status
                        :body           body})))
 
 ; --- dynamo body decode ---
@@ -105,11 +105,9 @@
     x))
 
 (def dynamo-port 8000)
-(def dynamo-port-str (str 8000))
 
 (defmethod proto/protocol-matches? :dynamodb [_ record]
-  (and (contains? (set (proto/->vec (get-in record [:layers :tcp :tcp_tcp_port]))) dynamo-port-str)
-       (contains? (:layers record) :http)))
+  (contains? (:layers record) :http))
 
 (defmethod proto/extract-and-decode-fields :dynamodb [m]
   (let [fields (dynamo-fields m)]
