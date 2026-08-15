@@ -6,6 +6,7 @@
             [clojure.pprint :as pp]
             [clojure.string :as str])
   (:import [net.sourceforge.plantuml SourceStringReader FileFormat FileFormatOption]
+           [java.awt Desktop]
            [java.io ByteArrayOutputStream]))
 
 ;; pprint has no structural dispatch for tagged literals (fressian-decode's
@@ -192,12 +193,24 @@
     (.outputImage reader out (FileFormatOption. FileFormat/SVG))
     (.toString out "UTF-8")))
 
+(defn- open-file!
+  "Opens `path` in the OS's default handler for its file type (e.g. a browser
+   for an .svg), if the platform supports it."
+  [path]
+  (when (Desktop/isDesktopSupported)
+    (.open (Desktop/getDesktop) (io/file path))))
+
 (defn write-svg!
+  "Renders events to an SVG at `path` (see events->plantuml for opts) and
+   returns `path` resolved to an absolute path. :open? (default true) opens
+   the file in the OS's default viewer after writing it."
   ([events path] (write-svg! events path nil))
-  ([events path opts]
+  ([events path {:keys [open?] :or {open? true} :as opts}]
    (with-open [w (io/writer path)]
      (.write w (plantuml->svg (events->plantuml events opts))))
-   path))
+   (let [full-path (.getCanonicalPath (io/file path))]
+     (when open? (open-file! full-path))
+     full-path)))
 
 (comment
   ;; Minimal: events already have :from/:to, no styling. :body renders as a

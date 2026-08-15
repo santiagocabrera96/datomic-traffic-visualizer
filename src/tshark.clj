@@ -366,8 +366,10 @@
                       *.ports.edn (and overriding it on conflict) and the
                       dynamodb/memcache server-port defaults
      :protocol-styles merged over the default dynamodb/memcache styles
+     :open?           passed through to write-svg! (default true) -- opens
+                      the rendered SVG in the OS's default viewer
    Any other opt (e.g. :title, :label-fn) is passed through to
-   diagram/write-svg!."
+   diagram/write-svg!. Returns the SVG's absolute path."
   [tshark-log-file & [{:keys [svg-path since noisy? port-names protocol-styles]
                         :or   {svg-path (str tshark-log-file ".svg")
                                noisy?   default-noisy?}
@@ -386,8 +388,7 @@
                          (merge {:regions regions}
                                 (dissoc opts :svg-path :since :noisy? :port-names :protocol-styles)
                                 {:port-names      (merge default-port-names file-port-names port-names)
-                                 :protocol-styles (merge default-protocol-styles protocol-styles)}))
-    svg-path))
+                                 :protocol-styles (merge default-protocol-styles protocol-styles)}))))
 
 (comment
   (draw-diagram! "/tmp/tshark.log")
