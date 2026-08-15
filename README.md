@@ -36,58 +36,55 @@ lives entirely in `src/setup.clj` + `src/tshark.clj` + `src/diagram.clj` +
 
 1. `scripts/setup.sh` — one-time install of memcached, Datomic Pro,
    DynamoDB Local, tshark, and generation of the transactor config.
-2. Start a capture *before* loading `setup.clj` (tshark needs to be
+2. Start a capture *before* starting the stack (tshark needs to be
    running first to see the initial TCP handshakes):
    ```
    scripts/capture.sh [path]
    ```
    Writes to `path` if given, else `$TSHARK_LOG`, else `/tmp/tshark.log`.
-   Leave it running in its own terminal; stop it with Ctrl-C once you're
-   done with step 4.
-3. `clj -M:setup` (or load `src/setup.clj` in your editor's REPL) loads
-   the namespace's top-level defs — `pids`/`port-owners`/`regions` atoms,
-   the `region` macro, `start-all!`/`stop-all!` — but does **not** start
-   anything by itself; there's no `-main`. Then, from its trailing
-   `(comment ...)` block:
-   ```clojure
-   (def session (start-all! (or (System/getenv "TSHARK_LOG") "/tmp/tshark.log")))
-   ```
-   starts DynamoDB Local, memcached, and the transactor together (they
-   only make sense as a set — `pids`/the port mapping built from them
-   needs all three), connects a peer, and transacts a small schema.
-   `start-all!` also kicks off `start-port-watcher!`, which keeps
-   `port-owners` current via periodic `lsof` sweeps for as long as the
-   REPL runs, and returns a session map (`:since`, `:tshark-log`, the
-   started processes, ...) worth holding onto for later steps.
-4. Do your peer work at the REPL (`d/transact`, `d/pull`, `d/q`, ...) —
-   see the full sweep of examples already in `setup.clj`'s `(comment
-   ...)` block, covering writes, retracts, queries, pull/entity/touch,
-   raw datom/index access, `as-of`/`since`/`history`, `with`, and
-   `tx-range`. Wrap any call you want called out in the diagram in
-   `(region ...)` — e.g. `(region (d/pull (d/db conn) '[*] [:item/id
-   1]))` — and its traffic gets boxed under a `group` labeled with that
-   exact code. `port-owners`/`regions` are auto-dumped to
-   `<tshark-log>.ports.edn` / `<tshark-log>.regions.edn` on every change,
-   so they're already on disk whenever you're ready to render.
-5. Stop the tshark capture, then render the diagram straight from the
-   same REPL:
-   ```clojure
-   (require 'tshark)
-   (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
-   ```
-   Reads the log plus its sibling `.ports.edn`/`.regions.edn` files,
-   decodes everything, and writes an SVG (default: `<tshark-log>.svg`).
-   `:since` (epoch millis, same domain as tshark's own `:timestamp`)
-   drops events before that point — passing the session's `:since` skips
-   DynamoDB Local/memcached/transactor startup noise. The transactor's
-   ~5s `pod-coord` heartbeat/lease traffic (see "Known item shapes"
-   below) is dropped by default too, both the request and its paired
-   response; pass `{:noisy? (constantly false)}` to keep it. See
-   `tshark/draw-diagram!`'s docstring for the rest of its opts
-   (`:svg-path`, `:port-names`, `:protocol-styles`).
-6. When done, tear the stack down from `setup.clj`'s trailing `(comment
-   ...)` block (`d/delete-database`, then `stop-all!`) — left commented
-   so loading the file never tears down a previous session by accident.
+   Leave it running in its own terminal; stop it with Ctrl-C once the run
+   below has produced its diagram.
+3. Run the demo, either:
+   - **In the terminal**, all at once: `clj -M demo.clj` — starts the
+     stack, runs a sweep across the Datomic peer API, renders the
+     diagram, and tears the stack back down, top to bottom, then exits.
+   - **In the REPL**, step by step: load `src/setup.clj` (`clj -M:setup`,
+     or your editor's REPL), then work through `demo.clj`'s forms one at
+     a time yourself — same content, but you decide what to run and when,
+     and can poke around in between (`(d/q ...)` your own queries, inspect
+     `db`/`conn`, etc.) before rendering.
+
+   Either way, the run:
+   - `(start-all! tshark-log-file)` starts DynamoDB Local, memcached, and
+     the transactor together (they only make sense as a set — `pids`/the
+     port mapping built from them needs all three), connects a peer, and
+     transacts a small schema. It also kicks off `start-port-watcher!`,
+     which keeps `port-owners` current via periodic `lsof` sweeps, and
+     returns a session map (`:since`, `:tshark-log`, the started
+     processes, ...).
+   - does a sweep across the rest of the Datomic peer API — writes,
+     retracts, queries, pull/entity/touch, raw datom/index access,
+     `as-of`/`since`/`history`, `with`, `tx-range` — each call wrapped in
+     `(region ...)`, which boxes its traffic under a labeled `group` in
+     the diagram. `port-owners`/`regions` are auto-dumped to
+     `<tshark-log>.ports.edn` / `<tshark-log>.regions.edn` on every
+     change, so they're already on disk by the time it renders.
+   - renders the diagram:
+     ```clojure
+     (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
+     ```
+     Reads the log plus its sibling `.ports.edn`/`.regions.edn` files,
+     decodes everything, and writes an SVG (default: `<tshark-log>.svg`).
+     `:since` (epoch millis, same domain as tshark's own `:timestamp`)
+     drops events before that point — passing the session's `:since`
+     skips DynamoDB Local/memcached/transactor startup noise. The
+     transactor's ~5s `pod-coord` heartbeat/lease traffic (see "Known
+     item shapes" below) is dropped by default too, both the request and
+     its paired response; pass `{:noisy? (constantly false)}` to keep it.
+     See `tshark/draw-diagram!`'s docstring for the rest of its opts
+     (`:svg-path`, `:port-names`, `:protocol-styles`).
+   - tears the stack down (`d/delete-database`, then `stop-all!`).
+4. Stop the tshark capture (Ctrl-C) once the diagram's been rendered.
 
 ## Pipeline (`src/tshark.clj`)
 

@@ -224,11 +224,9 @@
   ;; From here, the REPL is ready -- run your own queries/transactions, e.g.:
   ;;   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
   ;;   (region (d/pull (d/db conn) '[*] [:item/id 1]))
-  ;; wrapping a call in `region` labels its traffic in events.svg with that
-  ;; exact code. Then, once tshark's capture (scripts/capture.sh, run
-  ;; beforehand in its own terminal) has what you want:
-  ;;   (require 'tshark)
-  ;;   (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
+  ;; wrapping a call in `region` labels its traffic in the diagram with that
+  ;; exact code. This whole block (below too) is also runnable top to
+  ;; bottom, unattended, as demo.clj -- `clj -M demo.clj`.
 
   ;; A sweep across the rest of the Datomic peer API, so a capture can be
   ;; validated against every shape of traffic the pipeline needs to decode
@@ -281,13 +279,10 @@
   (region (do (d/request-index conn)
               (Thread/sleep 3000)))
 
+  ;; Render the capture into a sequence diagram. :since skips DynamoDB
+  ;; Local/memcached/transactor startup noise below `session`'s start time.
   (require 'tshark)
-  (tshark/draw-diagram! "/tmp/tshark.log")
   (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
-  (def since (System/currentTimeMillis))
-  (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
-  (tshark/draw-diagram! (:tshark-log session) {:since since})
-
 
   ;; Manual teardown.
   (region (d/delete-database db-uri))
