@@ -3,10 +3,4 @@
          com.amazonaws/aws-java-sdk-dynamodb {:mvn/version "1.12.564"}
          com.cnuernber/charred {:mvn/version "1.041"}
          org.clojure/data.fressian {:mvn/version "1.1.1"}
-         io.github.Datomic-Nubank/fressian-dasm {:git/sha "4a29a0a4022e880756573a9dfa4f04d6335e6ce3"}
-         prismatic/schema {:mvn/version "1.4.1"}
-         net.sourceforge.plantuml/plantuml {:mvn/version "1.2024.8"}}
- :aliases {:setup {:main-opts ["-i" "src/setup.clj" "-r"]}}}
-
-
-
+         net.sourceforge.plantuml/plantuml {:mvn/version "1.2024.8"}}}

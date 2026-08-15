@@ -48,11 +48,12 @@ lives entirely in `src/setup.clj` + `src/tshark.clj` + `src/diagram.clj` +
    - **In the terminal**, all at once: `clj -M demo.clj` — starts the
      stack, runs a sweep across the Datomic peer API, renders the
      diagram, and tears the stack back down, top to bottom, then exits.
-   - **In the REPL**, step by step: load `src/setup.clj` (`clj -M:setup`,
-     or your editor's REPL), then work through `demo.clj`'s forms one at
-     a time yourself — same content, but you decide what to run and when,
-     and can poke around in between (`(d/q ...)` your own queries, inspect
-     `db`/`conn`, etc.) before rendering.
+   - **In the REPL**, step by step: load `src/setup.clj` in your editor's
+     REPL, then work through `demo.clj`'s forms one at a time yourself —
+     same content, but you decide what to run and when, and can poke
+     around in between (`(d/q ...)` your own queries, inspect `db`/`conn`,
+     etc.) before rendering. `setup.clj`'s trailing `(comment ...)` block
+     is exactly `demo.clj`'s content, for this purpose.
 
    Either way, the run:
    - `(start-all! tshark-log-file)` starts DynamoDB Local, memcached, and
@@ -85,6 +86,22 @@ lives entirely in `src/setup.clj` + `src/tshark.clj` + `src/diagram.clj` +
      (`:svg-path`, `:port-names`, `:protocol-styles`).
    - tears the stack down (`d/delete-database`, then `stop-all!`).
 4. Stop the tshark capture (Ctrl-C) once the diagram's been rendered.
+
+To just see how it looks, steps 2-4 can be run as a single line (capture
+starts in the background, `demo.clj` runs in the foreground, then the
+capture is killed once it returns):
+
+```
+sudo -v; ./scripts/capture.sh & pid=$!; clj -M demo.clj; kill "$pid"
+```
+
+To write the capture to a specific path instead of the default
+`/tmp/tshark.log`, set `TSHARK_LOG` for that line only (wrapped in
+`sh -c` so the whole `;`/`&`-chained sequence sees it):
+
+```
+TSHARK_LOG=/tmp/my.log sh -c 'sudo -v; ./scripts/capture.sh & pid=$!; clj -M demo.clj; kill "$pid"'
+```
 
 ## Pipeline (`src/tshark.clj`)
 

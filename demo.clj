@@ -72,7 +72,8 @@
 ;; From @alex: Transactor will go put segments in memcache before announcing
 ;; that an indexing job happened. Trigger one explicitly, rather than
 ;; waiting for its usual schedule, so the capture sees that write.
-(region (do (d/request-index conn)
+(region "Indexing job"
+        (do (d/request-index conn)
             (Thread/sleep 3000)))
 
 ;; Render the capture into a sequence diagram. :since skips DynamoDB
