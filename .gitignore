@@ -1,0 +1,11 @@
+.claude/
+.cpcache/
+.idea/
+.mcp.json
+.nrepl-port
+.playwright-mcp/
+*.iml
+datomic-pro-*/
+datomic-pro-*.zip
+dynamodb-local/
+dynamodb-local-metadata.json
