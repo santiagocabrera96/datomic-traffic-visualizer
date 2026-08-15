@@ -17,5 +17,5 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-${TSHARK_LOG:-/tmp/tshark.log}}"
 
 echo "Capturing to ${OUT} (Ctrl-C to stop)..."
-sudo tshark -i lo0 -f "tcp port 8000 or tcp port 11211" -T ek -l \
+exec sudo tshark -i lo0 -f "tcp port 8000 or tcp port 11211" -T ek -l \
   -d tcp.port==8000,http > "${OUT}"
