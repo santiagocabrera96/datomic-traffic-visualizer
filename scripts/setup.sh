@@ -73,11 +73,11 @@ memory-index-threshold=32m
 memory-index-max=256m
 object-cache-max=128m
 # Route the transactor's storage-object cache through the memcached
-# instance started when src/setup.clj loads (\`clj -M:setup\`).
+# instance started by demo.clj / src/setup.clj's start-all! (\`clj -M demo.clj\`).
 memcached=localhost:11211
 EOF
 
 echo "Wrote ${CONFIG}"
 echo
 echo "Done. Capture traffic first: scripts/capture.sh"
-echo "Next: clj -M:setup"
+echo "Next: clj -M demo.clj"
