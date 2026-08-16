@@ -33,27 +33,79 @@
     (not (contains? event :from)) (assoc :from (resolve-port port-names (:srcport event)))
     (not (contains? event :to))   (assoc :to   (resolve-port port-names (:dstport event)))))
 
-(def ^:private max-line-length 200)
+(def ^:private default-max-line-length 80)
 
-(defn- wrap-line [line]
-  (->> (partition-all max-line-length line)
-       (map (partial apply str))
-       (str/join "\n")))
+;; PlantUML's `skinparam wrapWidth` wraps note/message text at word
+;; boundaries during actual rendering (real glyph widths), so there's no
+;; need to hard-wrap ordinary text ourselves -- just give it a pixel budget
+;; roughly equivalent to :max-line-length characters at its default font
+;; size. It only wraps at whitespace, though -- see break-long-word below.
+(def ^:private px-per-char 7)
+
+;; pr-str/pprint's own escaping of a string's non-printable chars: either a
+;; \uXXXX (4 hex digit) unicode escape, or one of the 2-char short escapes
+;; (\n \r \t \b \f \\ \"), or (falling through the alternation) a single
+;; ordinary char. Tokenizing on this lets break-long-word insert a forced
+;; line break between tokens without ever cutting one in half -- e.g.
+;; splitting a \u001F escape into \u00 and 1F, which would garble it
+;; into plain text.
+(def ^:private escape-token-pattern #"\\u[0-9A-Fa-f]{4}|\\.|(?s).")
+
+(defn- break-long-word
+  "word, with a forced newline inserted every max-line-length chars, if it's
+   over that long -- skinparam wrapWidth only wraps at whitespace, so a
+   whitespace-free run (e.g. a raw binary blob's escaped bytes, with no
+   real spaces to wrap at) longer than that would otherwise never wrap at
+   all, blowing out the whole note's rendered width. Tokenizes on pr-str's
+   escape sequences first so an inserted break never lands inside one."
+  [max-line-length word]
+  (if (<= (count word) max-line-length)
+    word
+    (->> (re-seq escape-token-pattern word)
+         (reduce (fn [{:keys [out cur len]} tok]
+                   (let [tlen (count tok)]
+                     (if (and (pos? len) (> (+ len tlen) max-line-length))
+                       {:out (conj out cur) :cur tok :len tlen}
+                       {:out out :cur (str cur tok) :len (+ len tlen)})))
+                 {:out [] :cur "" :len 0})
+         ((fn [{:keys [out cur]}] (conj out cur)))
+         (str/join "\n"))))
+
+(defn- break-long-words
+  "line, with break-long-word applied to each whitespace-delimited run --
+   splitting on the zero-width boundary around \\s keeps whitespace chars
+   as their own pieces (rather than consuming them), so they're rejoined
+   verbatim -- ordinary short runs pass through untouched, left to
+   skinparam wrapWidth to wrap normally at render time."
+  [max-line-length line]
+  (->> (str/split line #"(?<=\s)|(?=\s)")
+       (map (partial break-long-word max-line-length))
+       (apply str)))
 
 (defn- strip-invalid-xml-chars
-  "XML 1.0 forbids most C0 control chars (e.g. \\u000b in an un-decoded raw
-   body); left in, they break SVG serialization for the whole diagram."
+  "Strips C0 control chars (e.g. \\u000b in an un-decoded raw body) -- XML
+   1.0 forbids most of these, and left in, they break SVG serialization for
+   the whole diagram -- plus C0/C1 control chars (\\x7F-\\x9F), which are
+   XML-legal but have crashed PlantUML's own note parser on a raw binary
+   payload naively decoded as text."
   [s]
-  (str/replace s #"[\x00-\x08\x0B\x0C\x0E-\x1F]" "?"))
+  (str/replace s #"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]" "?"))
 
 (defn- fmt-note
   "Joins note lines into PlantUML's one-line `note over` format, escaping
    newlines and [ ] (PlantUML's creole parser reads [[...]] as a link, which
-   pretty-printed nested vectors trigger constantly)."
-  [lines]
+   pretty-printed nested vectors trigger constantly). Real newlines here are
+   genuine logical breaks (a pretty-printed map's own structural line
+   breaks) that PlantUML should always honor as a line break, distinct from
+   the word-boundary visual wrapping `skinparam wrapWidth` handles at
+   render time -- so unlike those, they aren't left for PlantUML to decide.
+   break-long-words forces breaks into any whitespace-free run wider than
+   max-line-length too -- wrapWidth alone leaves those untouched (e.g. a raw
+   binary blob's escaped bytes, with no spaces to wrap at), which blows out
+   the whole note's rendered width instead of wrapping."
+  [max-line-length lines]
   (->> lines
-       (mapcat str/split-lines)
-       (map wrap-line)
+       (map (partial break-long-words max-line-length))
        (str/join "\n")
        strip-invalid-xml-chars
        (#(str/replace % "\n" "\\n"))
@@ -98,7 +150,7 @@
     (format "|<back:%s>    </back>| %s |" color label)))
 
 (defn- event->plantuml
-  [label-fn protocol-styles event]
+  [label-fn protocol-styles max-line-length event]
   (let [[from to] (map fmt-participant [(:from event) (:to event)])
         lines     (note-lines event)
         color     (event-color protocol-styles event)]
@@ -108,7 +160,7 @@
                                (strip-invalid-xml-chars (label-fn event)))
                        (when (seq lines)
                          (format "note over \"%s\", \"%s\"%s: %s" from to (if color (str " " color) "")
-                                 (fmt-note lines)))]))))
+                                 (fmt-note max-line-length lines)))]))))
 
 (defn- region-for
   "Which of `regions` (if any) `ts` falls in. Regions are assumed disjoint."
@@ -161,20 +213,26 @@
           :protocol-styles {protocol -> {:color \"#...\" :label \"...\"}}  colors
                             that protocol's arrows/notes and lists it in the
                             legend; a protocol missing from it gets no color
-                            and no legend line}"
+                            and no legend line
+          :max-line-length n                       PlantUML's skinparam wrapWidth,
+                            in pixels-per-character terms -- note/message text
+                            wraps at word boundaries around n characters wide
+                            (default 80)}"
   ([events] (events->plantuml events nil))
-  ([events {:keys [title label-fn regions port-names protocol-styles]
-            :or   {label-fn default-label port-names {} protocol-styles {}}}]
+  ([events {:keys [title label-fn regions port-names protocol-styles max-line-length]
+            :or   {label-fn default-label port-names {} protocol-styles {}
+                   max-line-length default-max-line-length}}]
    (let [events       (->> events (sort-by :timestamp) (map (partial attach-participants port-names)))
          participants (->> events (mapcat (juxt :from :to)) distinct (map fmt-participant))]
      (str/join "\n"
                (remove nil?
                        (concat
                          ["@startuml"]
+                         [(str "skinparam wrapWidth " (* max-line-length px-per-char))]
                          (when title [(str "title " title)])
                          ["autonumber"]
                          (map #(format "participant \"%s\"" %) participants)
-                         (grouped-lines regions events (map #(event->plantuml label-fn protocol-styles %) events))
+                         (grouped-lines regions events (map #(event->plantuml label-fn protocol-styles max-line-length %) events))
                          (when (seq (legend-lines protocol-styles))
                            (concat ["legend top left"] (legend-lines protocol-styles) ["endlegend"]))
                          ["@enduml"]))))))

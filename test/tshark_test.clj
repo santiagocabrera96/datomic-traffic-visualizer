@@ -59,11 +59,11 @@
 
 (defn tshark->tcp
   "A drawable event (see diagram/write-svg!): flat :timestamp/:srcport/
-   :dstport/:protocol/:tag at the top level (:tag/:note are the arrow
-   label/note diagram.clj draws; :stream is also mirrored at the top level,
-   alongside them, since that's what tshark/remove-noise's per-stream
+   :dstport/:protocol at the top level (:stream is also mirrored at the top
+   level, alongside them, since that's what tshark/remove-noise's per-stream
    request/response pairing keys off), plus the fuller decoded detail
-   (ports, stream, len, flags, payload) nested under :tcp."
+   (ports, stream, len, flags, payload) nested under :tcp. :tag/:note (the
+   arrow label/note diagram.clj draws) aren't set here -- see `draw`."
   [record]
   (when-let [tcp (get-in record [:layers :tcp])]
     (let [ports (:tcp_tcp_port tcp)
@@ -79,8 +79,6 @@
          :srcport src-port
          :dstport dst-port
          :stream stream
-         :tag (flags->tag flags)
-         :note payload
          :tcp {:ports    (into #{} (map parse-long) ports)
                :src-port src-port
                :dst-port dst-port
@@ -104,11 +102,9 @@
    single map or a vector of several PDUs packed into one TCP segment (see
    tshark.clj's split-memcache-messages), so this walks them in order,
    accumulating each PDU's byte offset into the shared TCP payload already
-   decoded by tshark->tcp. Layers the memcache-specific fields on top: :tag
-   (the command, e.g. :get/:set) at the top level (for diagram.clj's arrow
-   label), :note (the value bytes, sliced out of the PDU's own span past its
-   24-byte header + extras + key) for its note, plus the fuller semantic
-   detail (:operation, :key, :status, :payload) nested under :memcache."
+   decoded by tshark->tcp. Layers the fuller semantic detail (:operation,
+   :key, :status, :payload) on top, nested under :memcache. :tag/:note (the
+   arrow label/note diagram.clj draws) aren't set here -- see `draw`."
   [tcp-event]
   (when-let [memcache (get-in tcp-event [:layers :memcache])]
     (let [payload  (get-in tcp-event [:tcp :payload])
@@ -127,13 +123,11 @@
                   payload   (when (and payload (< from to) (<= to (count payload)))
                               (Arrays/copyOfRange ^bytes payload (int from) (int to)))]]
         (assoc tcp-event
-          :protocol  :memcache
-          :tag       operation
-          :note      payload
-          :memcache  {:operation operation
-                      :key       k
-                      :status    status
-                      :payload   payload})))))
+          :protocol :memcache
+          :memcache {:operation operation
+                     :key       k
+                     :status    status
+                     :payload   payload})))))
 
 (defn- json-body
   "tshark's hex-encoded http.file_data, decoded from hex and JSON-parsed --
@@ -161,8 +155,9 @@
    for why :layers is still readable off it). :layers :http holds one HTTP
    request or response; layers its semantic fields on top as a Ring-style
    request/response map nested under :http (:request-method + :uri +
-   :headers for a request, :status for a response, :body either way), plus
-   :tag/:note at the top level for diagram.clj's arrow label/note."
+   :headers for a request, :status for a response, :body either way).
+   :tag/:note (the arrow label/note diagram.clj draws) aren't set here --
+   see `draw`."
   [tcp-event]
   (when-let [http (get-in tcp-event [:layers :http])]
     (let [request-method (some-> (:http_http_request_method http) str/lower-case keyword)
@@ -172,16 +167,13 @@
           status         (some-> (:http_http_response_code http) parse-long)
           body           (json-body http)]
       [(assoc tcp-event
-         :protocol  :http
-         :tag       (or (some-> request-method name str/upper-case)
-                        (str status))
-         :note      body
-         :http      (some-vals
-                      {:request-method request-method
-                       :uri            uri
-                       :headers        headers
-                       :status         status
-                       :body           body}))])))
+         :protocol :http
+         :http     (some-vals
+                     {:request-method request-method
+                      :uri            uri
+                      :headers        headers
+                      :status         status
+                      :body           body}))])))
 
 (defn- dynamo-operation
   "DynamoDB's operation name, e.g. \"PutItem\" -- the part of the
@@ -202,22 +194,51 @@
    info (headers/status/body) is needed, so this doesn't touch the raw
    tshark record at all. Recognizes DynamoDB's shape on top of generic HTTP
    (the X-Amz-Target header naming the operation, AttributeValue-wrapped
-   fields, Datomic's own :v blob encoding) and layers it on top: :tag/:note
-   at the top level for diagram.clj's arrow label/note, plus the fuller
-   semantic detail (:operation, :key, :body) nested under :dynamo."
+   fields, Datomic's own :v blob encoding) and layers the fuller semantic
+   detail (:operation, :key, :body) on top, nested under :dynamo. :tag/:note
+   (the arrow label/note diagram.clj draws) aren't set here -- see `draw`."
   [http-event]
-  (let [{:keys [headers status body]} (:http http-event)
+  (let [{:keys [headers body]} (:http http-event)
         operation (dynamo-operation headers)
         decoded   body
         k         (dynamo-key decoded)]
     [(assoc http-event
        :protocol :dynamodb
-       :tag      (if operation (str operation " " k) (str status))
-       :note     decoded
        :dynamo   (some-vals
                    {:operation operation
                     :key       k
                     :body      decoded}))]))
+
+(defmulti draw
+  "Given a drawable event (see diagram/write-svg!) whose semantic detail
+   (:tcp/:memcache/:http/:dynamo) is already parsed and merged in, decides
+   what diagram.clj should draw for it, returning `event` with :tag/:note
+   added. Dispatches on :protocol -- the one place that decision lives.
+   Called once, right before drawing (see the `comment` block below) -- not
+   by the protocol parsers above."
+  :protocol)
+
+(defmethod draw :tcp [event]
+  (assoc event
+    :tag  (flags->tag (get-in event [:tcp :flags]))
+    :note (String. (get-in event [:tcp :payload]))))
+
+(defmethod draw :memcache [event]
+  (assoc event
+    :tag  (get-in event [:memcache :operation])
+    :note (get-in event [:memcache :payload])))
+
+(defmethod draw :http [event]
+  (let [{:keys [request-method status body]} (:http event)]
+    (assoc event
+      :tag  (or (some-> request-method name str/upper-case) (str status))
+      :note body)))
+
+(defmethod draw :dynamodb [event]
+  (let [{:keys [operation key body]} (:dynamo event)]
+    (assoc event
+      :tag  (if operation (str operation " " key) (str (get-in event [:http :status])))
+      :note body)))
 
 (defn- noisy?
   "Same call as tshark/default-noisy?, just reading the key from wherever
@@ -266,6 +287,26 @@
               (rf result e))))))))
   ([noisy? events] (sequence (remove-noise noisy?) events)))
 
+(defn- unpack-7bit-lsb [^String s]
+  (let [n (count s)
+        nbytes (quot (* 7 n) 8)
+        out (byte-array nbytes)]
+    (dotimes [i n]
+      (let [c (long (.charAt s i)) bit-pos (* 7 i)]
+        (dotimes [b 7]
+          (when (bit-test c b)
+            (let [pos (+ bit-pos b) byte-idx (quot pos 8) bit-in-byte (rem pos 8)]
+              (when (< byte-idx nbytes)
+                (aset out byte-idx (unchecked-byte (bit-or (bit-and 0xff (aget out byte-idx))
+                                                           (bit-shift-left 1 bit-in-byte))))))))))
+    out))
+(defn update-in-if-present [m ks f]
+  (if (not= ::missing (get-in m ks ::missing))
+    (update-in m ks f)
+    m))
+(defn decode-datomic [event]
+  event)
+
 (comment
   (require '[diagram])
   (def tcp-events (mapcat tshark->tcp tshark-lines))
@@ -280,15 +321,27 @@
   (def dynamo-events-quiet
     (remove-noise noisy? dynamo-events))
 
+  (def events (map decode-datomic dynamo-events-quiet))
+
   (def port-names (clojure.edn/read-string (slurp "/tmp/tshark.log.ports.edn")))
-  (diagram/write-svg! tcp-events "/tmp/tcp.svg"
-                      {:port-names port-names})
-  (diagram/write-svg! memcache-events "/tmp/memcache.svg"
-                      {:port-names port-names})
-  (diagram/write-svg! http-events "/tmp/http.svg"
-                      {:port-names port-names})
-  (diagram/write-svg! dynamo-events "/tmp/dynamo.svg"
-                      {:port-names port-names})
-  (diagram/write-svg! dynamo-events-quiet "/tmp/dynamo-quiet.svg"
-                      {:port-names port-names}))
+  (def protocol-styles
+    {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}
+     :memcache {:color "#FDFF94" :label "Cache (memcached)"}
+     :tcp      {:color "#D3D3D3" :label "TCP"}
+     :http     {:color "#94C9FF" :label "HTTP"}})
+
+  ;; `draw` is called here, once, right before handing events to write-svg! --
+  ;; not by any of the protocol parsers above.
+  (diagram/write-svg! (map draw tcp-events) "/tmp/tcp.svg"
+                      {:port-names port-names :protocol-styles protocol-styles})
+  (diagram/write-svg! (map draw memcache-events) "/tmp/memcache.svg"
+                      {:port-names port-names :protocol-styles protocol-styles})
+  (diagram/write-svg! (map draw http-events) "/tmp/http.svg"
+                      {:port-names port-names :protocol-styles protocol-styles})
+  (diagram/write-svg! (map draw dynamo-events) "/tmp/dynamo.svg"
+                      {:port-names port-names :protocol-styles protocol-styles})
+  (diagram/write-svg! (map draw dynamo-events-quiet) "/tmp/dynamo-quiet.svg"
+                      {:port-names port-names :protocol-styles protocol-styles})
+  (diagram/write-svg! (map draw events) "/tmp/events.svg"
+                      {:port-names port-names :protocol-styles protocol-styles}))
 
