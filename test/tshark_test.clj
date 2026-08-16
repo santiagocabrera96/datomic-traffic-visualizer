@@ -60,8 +60,10 @@
 (defn tshark->tcp
   "A drawable event (see diagram/write-svg!): flat :timestamp/:srcport/
    :dstport/:protocol/:tag at the top level (:tag/:note are the arrow
-   label/note diagram.clj draws), plus the fuller decoded detail (ports,
-   stream, len, flags, payload) nested under :tcp."
+   label/note diagram.clj draws; :stream is also mirrored at the top level,
+   alongside them, since that's what tshark/remove-noise's per-stream
+   request/response pairing keys off), plus the fuller decoded detail
+   (ports, stream, len, flags, payload) nested under :tcp."
   [record]
   (when-let [tcp (get-in record [:layers :tcp])]
     (let [ports (:tcp_tcp_port tcp)
@@ -70,17 +72,19 @@
           src-port (parse-long (:tcp_tcp_srcport tcp))
           dst-port (parse-long (:tcp_tcp_dstport tcp))
           payload (byte-array (hex-payload->bytes (:tcp_tcp_payload tcp)))
-          len (parse-long (:tcp_tcp_len tcp))]
+          len (parse-long (:tcp_tcp_len tcp))
+          stream (parse-long (:tcp_tcp_stream tcp))]
       [(assoc record
          :protocol :tcp
          :srcport src-port
          :dstport dst-port
+         :stream stream
          :tag (flags->tag flags)
          :note payload
          :tcp {:ports    (into #{} (map parse-long) ports)
                :src-port src-port
                :dst-port dst-port
-               :stream   (parse-long (:tcp_tcp_stream tcp))
+               :stream   stream
                :len      len
                :flags    flags
                :payload  payload})])))
@@ -215,6 +219,53 @@
                     :key       k
                     :body      decoded}))]))
 
+(defn- noisy?
+  "Same call as tshark/default-noisy?, just reading the key from wherever
+   it's nested here (:dynamo/:memcache) instead of a top-level :key --
+   assumes the transactor's heartbeat/lease traffic is always a GetItem or
+   PutItem on item id \"pod-coord\"."
+  [event]
+  (#{"pod-coord"} (get-in event [:dynamo :key])))
+
+(defn- request? [event] (contains? tshark/protocol-ports (:dstport event)))
+
+(defn remove-noise
+  "Stateful transducer: drops requests matching `noisy?` -- a predicate over
+   a request event, e.g. `#(= \"pod-coord\" (:key %))`, called only on
+   requests, can be anything -- together with their paired response. Pairs
+   requests to responses via a per-stream FIFO queue of pending verdicts (so
+   a stream with several in-flight requests remembers each one in order);
+   assumes responses come back in the same order their requests were sent,
+   per stream. One pass over the seq, no need to hold it all in memory, and
+   no metadata added to surviving events.
+
+   Called with just `noisy?`, returns the transducer, for composing into a
+   larger `comp` chain; called with `noisy?` and a seq of events, applies it
+   directly and returns the resulting (lazy) seq -- same two-arity
+   convention as `clojure.core/map`/`filter`/etc."
+  ([noisy?]
+   (fn [rf]
+     (let [pending (volatile! {})]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result e]
+          (let [stream (:stream e)]
+            (cond
+              (request? e)
+              (let [drop? (boolean (noisy? e))]
+                (vswap! pending update stream (fnil conj []) drop?)
+                (if drop? result (rf result e)))
+
+              (contains? @pending stream)
+              (let [drop? (first (get @pending stream))]
+                (vswap! pending update stream (comp vec rest))
+                (if drop? result (rf result e)))
+
+              :else
+              (rf result e))))))))
+  ([noisy? events] (sequence (remove-noise noisy?) events)))
+
 (comment
   (require '[diagram])
   (def tcp-events (mapcat tshark->tcp tshark-lines))
@@ -222,6 +273,12 @@
   (def http-events (mapcat tshark-tcp->http tcp-events))
   (def dynamo-events (mapcat http->dynamo http-events))
 
+  ;; remove-noise pairs a request to its response by :stream (a per-stream
+  ;; FIFO), so it needs a single seq holding both dynamo's requests and
+  ;; responses -- and in :timestamp order, same as draw-diagram!'s own
+  ;; pipeline sorts before drawing.
+  (def dynamo-events-quiet
+    (remove-noise noisy? dynamo-events))
 
   (def port-names (clojure.edn/read-string (slurp "/tmp/tshark.log.ports.edn")))
   (diagram/write-svg! tcp-events "/tmp/tcp.svg"
@@ -231,5 +288,7 @@
   (diagram/write-svg! http-events "/tmp/http.svg"
                       {:port-names port-names})
   (diagram/write-svg! dynamo-events "/tmp/dynamo.svg"
+                      {:port-names port-names})
+  (diagram/write-svg! dynamo-events-quiet "/tmp/dynamo-quiet.svg"
                       {:port-names port-names}))
 
