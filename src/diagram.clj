@@ -93,16 +93,20 @@
 
 (defn- fmt-note
   "Joins note lines into PlantUML's one-line `note over` format, escaping
-   newlines and [ ] (PlantUML's creole parser reads [[...]] as a link, which
-   pretty-printed nested vectors trigger constantly). Real newlines here are
-   genuine logical breaks (a pretty-printed map's own structural line
-   breaks) that PlantUML should always honor as a line break, distinct from
-   the word-boundary visual wrapping `skinparam wrapWidth` handles at
-   render time -- so unlike those, they aren't left for PlantUML to decide.
-   break-long-words forces breaks into any whitespace-free run wider than
-   max-line-length too -- wrapWidth alone leaves those untouched (e.g. a raw
-   binary blob's escaped bytes, with no spaces to wrap at), which blows out
-   the whole note's rendered width instead of wrapping."
+   newlines and [ ] and leading # (PlantUML's creole parser reads [[...]] as
+   a link, which pretty-printed nested vectors trigger constantly -- and
+   reads a line starting with # as a numbered-list item, silently replacing
+   it with an ordinal like \"1.\" and dropping the #, which a pprinted
+   TaggedLiteral's own \"#tag \" prefix triggers just as constantly).
+   Real newlines here are genuine logical breaks (a pretty-printed map's own
+   structural line breaks) that PlantUML should always honor as a line
+   break, distinct from the word-boundary visual wrapping `skinparam
+   wrapWidth` handles at render time -- so unlike those, they aren't left
+   for PlantUML to decide. break-long-words forces breaks into any
+   whitespace-free run wider than max-line-length too -- wrapWidth alone
+   leaves those untouched (e.g. a raw binary blob's escaped bytes, with no
+   spaces to wrap at), which blows out the whole note's rendered width
+   instead of wrapping."
   [max-line-length lines]
   (->> lines
        (map (partial break-long-words max-line-length))
@@ -110,7 +114,8 @@
        strip-invalid-xml-chars
        (#(str/replace % "\n" "\\n"))
        (#(str/replace % "[" "~["))
-       (#(str/replace % "]" "~]"))))
+       (#(str/replace % "]" "~]"))
+       (#(str/replace % "#" "~#"))))
 
 (defn- has-content?
   "True if body is non-nil and, when a collection/string, non-empty. Can't
@@ -174,7 +179,8 @@
       strip-invalid-xml-chars
       (str/replace #"\s+" " ")
       (str/replace "[" "~[")
-      (str/replace "]" "~]")))
+      (str/replace "]" "~]")
+      (str/replace "#" "~#")))
 
 (defn- grouped-lines
   "Wraps contiguous runs of `event-lines` (1:1 with `events`) in

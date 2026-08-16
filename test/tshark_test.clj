@@ -1,7 +1,9 @@
 (ns tshark-test
   (:require [charred.api :as charred]
+            [clojure.edn :as edn]
             [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [fressian-decode]
             [tshark])
   (:import (java.util Arrays)))
 
@@ -225,7 +227,7 @@
 
 (defmethod draw :memcache [event]
   (assoc event
-    :tag  (get-in event [:memcache :operation])
+    :tag (str (name (get-in event [:memcache :operation])) " " (get-in event [:memcache :key]))
     :note (get-in event [:memcache :payload])))
 
 (defmethod draw :http [event]
@@ -305,7 +307,17 @@
     (update-in m ks f)
     m))
 (defn decode-datomic [event]
-  event)
+  (cond
+    (seq (:payload (:memcache event)))
+    (update-in event [:memcache :payload] fressian-decode/decode-body)
+
+    (#{"pod-standby" "pod-coord"} (:S (:id (:Item (:body (:dynamo event))))))
+    (update-in-if-present event [:dynamo :body :Item :key :S] edn/read-string)
+
+    (some-> (:S (:id (:Item (:body (:dynamo event))))) parse-uuid)
+    (update-in-if-present event [:dynamo :body :Item :v :S] (comp fressian-decode/decode-body unpack-7bit-lsb))
+
+    :else event))
 
 (comment
   (require '[diagram])
@@ -321,7 +333,7 @@
   (def dynamo-events-quiet
     (remove-noise noisy? dynamo-events))
 
-  (def events (map decode-datomic dynamo-events-quiet))
+  (def events (map decode-datomic dynamo-events))
 
   (def port-names (clojure.edn/read-string (slurp "/tmp/tshark.log.ports.edn")))
   (def protocol-styles
@@ -334,7 +346,7 @@
   ;; not by any of the protocol parsers above.
   (diagram/write-svg! (map draw tcp-events) "/tmp/tcp.svg"
                       {:port-names port-names :protocol-styles protocol-styles})
-  (diagram/write-svg! (map draw memcache-events) "/tmp/memcache.svg"
+  (diagram/write-svg! (map draw events) "/tmp/memcache.svg"
                       {:port-names port-names :protocol-styles protocol-styles})
   (diagram/write-svg! (map draw http-events) "/tmp/http.svg"
                       {:port-names port-names :protocol-styles protocol-styles})
@@ -342,6 +354,6 @@
                       {:port-names port-names :protocol-styles protocol-styles})
   (diagram/write-svg! (map draw dynamo-events-quiet) "/tmp/dynamo-quiet.svg"
                       {:port-names port-names :protocol-styles protocol-styles})
-  (diagram/write-svg! (map draw events) "/tmp/events.svg"
+  (diagram/write-svg! (map (comp draw decode-datomic) dynamo-events) "/tmp/events.svg"
                       {:port-names port-names :protocol-styles protocol-styles}))
 
