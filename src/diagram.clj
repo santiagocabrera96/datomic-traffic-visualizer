@@ -71,23 +71,21 @@
     :else true))
 
 (defn- note-lines
-  "Pretty-prints :body when there's anything in it, else nil (no note). A raw
+  "Pretty-prints :note when there's anything in it, else nil (no note). A raw
    byte array (memcache body that didn't fressian-decode) renders as a byte
    count plus :decode-error instead of being pprinted."
-  [{:keys [body decode-error]}]
+  [{:keys [note decode-error]}]
   (cond
-    (bytes? body)
-    [(str "<" (alength ^bytes body) " raw bytes>"
+    (bytes? note)
+    [(str "<" (alength ^bytes note) " raw bytes>"
           (when decode-error (str " (decode error: " decode-error ")")))]
 
-    (has-content? body)
-    [(str/trim (with-out-str (pp/pprint body)))]))
+    (has-content? note)
+    [(str/trim (with-out-str (pp/pprint note)))]))
 
 (defn- default-label
-  [{:keys [operation key status]}]
-  (str operation
-       (when key (str " " key))
-       (when status (str " " status))))
+  [{:keys [tag]}]
+  (str tag))
 
 (defn- event-color [protocol-styles event]
   (:color (protocol-styles (:protocol event))))
@@ -213,21 +211,21 @@
      full-path)))
 
 (comment
-  ;; Minimal: events already have :from/:to, no styling. :body renders as a
+  ;; Minimal: events already have :from/:to, no styling. :note renders as a
   ;; `note over` under the arrow when present.
   (def events
-    [{:from :peer :to :dynamodb :timestamp 1 :operation "PutItem" :key "foo"
-      :body {:Item {:id "foo" :value 42}}}
-     {:from :dynamodb :to :peer :timestamp 2 :status 200}])
+    [{:from :peer :to :dynamodb :timestamp 1 :tag "PutItem foo"
+      :note {:Item {:id "foo" :value 42}}}
+     {:from :dynamodb :to :peer :timestamp 2 :tag "200"}])
   (println (events->plantuml events))
 
   ;; Same events, but naming participants by :srcport/:dstport instead --
   ;; :port-names resolves them (a port missing from the map renders as
   ;; :unknown-<port>).
   (def raw-events
-    [{:srcport 49515 :dstport 8000 :timestamp 1 :operation "PutItem" :key "foo"
-      :body {:Item {:id "foo" :value 42}}}
-     {:srcport 8000 :dstport 49515 :timestamp 2 :status 200}])
+    [{:srcport 49515 :dstport 8000 :timestamp 1 :tag "PutItem foo"
+      :note {:Item {:id "foo" :value 42}}}
+     {:srcport 8000 :dstport 49515 :timestamp 2 :tag "200"}])
   (println (events->plantuml raw-events {:port-names {8000 :dynamodb}}))
 
   ;; A title, a custom arrow label, and grouping a run of events under a
@@ -235,7 +233,7 @@
   (println (events->plantuml raw-events
                              {:port-names {8000 :dynamodb}
                               :title      "Demo"
-                              :label-fn   (fn [e] (str (:operation e) " " (:key e)))
+                              :label-fn   :tag
                               :regions    [{:label "warmup" :start 0 :end 1}]}))
 
   ;; Coloring/legend: pass :protocol-styles -- see dynamodb and memcache for

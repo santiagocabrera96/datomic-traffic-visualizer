@@ -84,3 +84,9 @@
 ;; terminal) before or after this, it doesn't matter.
 (region (d/delete-database db-uri))
 (stop-all! session)
+
+;; clojure.java.shell/sh (used by setup.clj's ensure-transactor-table!) runs
+;; on Clojure's agent send-off thread pool, whose threads are non-daemon and
+;; otherwise sit idle for up to 60s (its keep-alive) before dying on their
+;; own -- without this, the JVM doesn't actually exit until that decays.
+(shutdown-agents)

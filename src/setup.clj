@@ -4,7 +4,7 @@
   bottom, no -main. Installation/download stays in scripts/setup.sh."
   (:require [clojure.java.shell :as shell]
             [clojure.string :as str])
-  (:import [java.io File]
+  (:import [java.io File BufferedReader InputStreamReader]
            [java.net Socket]))
 
 ;; The atoms below are defonce'd so re-evaluating this file at the REPL
@@ -45,14 +45,23 @@
        result#)))
 
 (defn- lsof-ports
-  "Local TCP ports `pid` currently holds, per `lsof -Fn`."
+  "Local TCP ports `pid` currently holds, per `lsof -Fn`. Uses ProcessBuilder
+  (reading stdout on the calling thread) rather than clojure.java.shell/sh --
+  `sh` drains stdout/stderr on Clojure's non-daemon send-off agent pool, and
+  since this runs on every port-watcher sweep (as often as every few ms), a
+  single subprocess whose pipe outlives it (e.g. an fd inherited by another
+  forked child) wedges those pool threads forever and blocks JVM shutdown."
   [pid]
-  (->> (shell/sh "lsof" "-a" "-p" (str pid) "-iTCP" "-P" "-n" "-Fn")
-       :out
-       str/split-lines
-       (keep (fn [line]
-               (when (str/starts-with? line "n")
-                 (-> (subs line 1) (str/split #"->") first (str/split #":") peek parse-long))))))
+  (let [proc (-> (ProcessBuilder. ["lsof" "-a" "-p" (str pid) "-iTCP" "-P" "-n" "-Fn"])
+                 (.redirectErrorStream true)
+                 .start)
+        out  (with-open [rdr (BufferedReader. (InputStreamReader. (.getInputStream proc)))]
+               (str/join "\n" (line-seq rdr)))]
+    (.waitFor proc)
+    (->> (str/split-lines out)
+         (keep (fn [line]
+                 (when (str/starts-with? line "n")
+                   (-> (subs line 1) (str/split #"->") first (str/split #":") peek parse-long)))))))
 
 (defn refresh-ports!
   "One lsof sweep over every pid in `pids`, merged into `port-owners`."
@@ -69,10 +78,28 @@
       (do (refresh-ports!) (@port-owners port))))
 
 (defn start-port-watcher!
-  "Background daemon thread sweeping `port-owners` every `interval-ms` (default 200)."
-  ([] (start-port-watcher! 40))
+  "Background daemon thread sweeping `port-owners` every `interval-ms`
+  (default 5) -- kept low since some connections (e.g. DynamoDB Local's
+  non-keep-alive client) live for just a few ms, and a sweep that never
+  lands inside a connection's lifetime misses it entirely. Safe at this
+  interval because `lsof-ports` reads its subprocess on this thread
+  directly (see its docstring) rather than via clojure.java.shell/sh's
+  non-daemon agent pool. Returns the Thread so callers can `.interrupt` it
+  (see stop-all!) -- otherwise it keeps sweeping (and shelling out to
+  lsof) even after the processes it's inspecting are torn down."
+  ([] (start-port-watcher! 5))
   ([interval-ms]
-   (doto (Thread. ^Runnable (fn [] (while true (refresh-ports!) (Thread/sleep interval-ms))))
+   (doto (Thread. ^Runnable (fn [] (try
+                                      (while (not (.isInterrupted (Thread/currentThread)))
+                                        (refresh-ports!)
+                                        (Thread/sleep interval-ms))
+                                      ;; .interrupt can land while refresh-ports! is
+                                      ;; blocked inside lsof-ports's proc.waitFor, not
+                                      ;; just during the sleep above -- either way it
+                                      ;; means stop-all! wants this thread gone, so
+                                      ;; just let the loop end instead of printing an
+                                      ;; uncaught-exception stack trace.
+                                      (catch InterruptedException _ nil))))
      (.setDaemon true)
      .start)))
 
@@ -156,8 +183,9 @@
   of port ownership + regions against `tshark-log-file` -- the log a
   customer's own tshark capture (see scripts/capture.sh's TSHARK_LOG) is
   writing to. Returns {:since ... :tshark-log ... :ports-path ...
-  :regions-path ... :dynamodb ... :memcached ... :transactor ...} rather than
-  def'ing anything -- the caller decides what (if anything) to hold onto."
+  :regions-path ... :dynamodb ... :memcached ... :transactor ...
+  :port-watcher ...} rather than def'ing anything -- the caller decides
+  what (if anything) to hold onto."
   [tshark-log-file]
   (let [since (System/currentTimeMillis)                    ; startup noise below `since` isn't peer traffic
         ports-path (str tshark-log-file ".ports.edn")
@@ -166,7 +194,7 @@
         ;; outlives this REPL session without a separate manual save step.
         _ (add-watch port-owners ::dump-on-change #(spit ports-path (pr-str %4)))
         _ (add-watch regions ::dump-on-change #(spit regions-path (pr-str %4)))
-        _ (start-port-watcher!)
+        port-watcher (start-port-watcher!)
         dynamodb (start-dynamodb-local!)
         _ (destroy-on-shutdown! dynamodb "dynamodb")
         _ (wait-for-port! dynamodb-port 10000)
@@ -181,14 +209,19 @@
      :regions-path regions-path
      :dynamodb     dynamodb
      :memcached    memcached
-     :transactor   transactor}))
+     :transactor   transactor
+     :port-watcher port-watcher}))
 
 (defn stop-all!
-  "Tears down a `session` map returned by start-all! -- destroys the
-  dynamodb/memcached/transactor processes and removes the port-owners/regions
-  add-watches (same ::dump-on-change key start-all! added them under) so a
-  later start-all! isn't spitting to a now-stopped session's paths."
-  [{:keys [dynamodb memcached transactor]}]
+  "Tears down a `session` map returned by start-all! -- stops the port
+  watcher, destroys the dynamodb/memcached/transactor processes, and removes
+  the port-owners/regions add-watches (same ::dump-on-change key start-all!
+  added them under) so a later start-all! isn't spitting to a now-stopped
+  session's paths. Stopping the watcher matters: left running, it keeps
+  shelling out to lsof against pids that no longer exist for the rest of
+  the JVM's life."
+  [{:keys [dynamodb memcached transactor port-watcher]}]
+  (when port-watcher (.interrupt ^Thread port-watcher))
   (remove-watch port-owners ::dump-on-change)
   (remove-watch regions ::dump-on-change)
   (.destroy ^Process transactor)
