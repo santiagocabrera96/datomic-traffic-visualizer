@@ -15,23 +15,8 @@
    tagged-literal, mirroring TaggedObject's own shape."
   (fn [tag _form] tag))
 
-(defmethod fressian-decode/decode-tagged "index-tdata" [tag form]
-  (tagged-literal
-    (symbol tag)
-    (let [[v e a t added] form]
-      (mapv #(zipmap [:e :a :v :t :added]  %&) e a v t added))))
-
-(defmethod fressian-decode/decode-tagged "index-dir-node" [tag form]
-  (tagged-literal
-    (symbol tag)
-    (let [[index-tdata segment-id _ datom-count] form]
-      (mapv #(zipmap [:first-datom :seg-id :datom-count] %&) (:form index-tdata) segment-id datom-count))))
-
-(defmethod fressian-decode/decode-tagged "index-root-node" [tag form]
-  (tagged-literal
-    (symbol tag)
-    (let [[index-tdata dir-id] form]
-      (mapv #(zipmap [:first-datom :dir-id] %&) (:form index-tdata) dir-id))))
+(defmethod decode-tagged :default [tag form]
+  (tagged-literal (symbol tag) (if (= 1 (count form)) (first form) form)))
 
 (defn- taggify
   "Recursively replace org.fressian.TaggedObject with clojure tagged literals

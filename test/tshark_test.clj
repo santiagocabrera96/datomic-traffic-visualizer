@@ -342,9 +342,12 @@
      :tcp      {:color "#D3D3D3" :label "TCP"}
      :http     {:color "#94C9FF" :label "HTTP"}})
 
-  (remove-method fressian-decode/decode-tagged "index-tdata")
-  (remove-method fressian-decode/decode-tagged "index-dir-node")
-  (remove-method fressian-decode/decode-tagged "index-root-node")
+  (defmethod fressian-decode/decode-tagged "index-tdata" [tag form]
+    (apply mapv vector form))
+  (defmethod fressian-decode/decode-tagged "index-dir-node" [tag form]
+    (apply mapv vector form))
+  (defmethod fressian-decode/decode-tagged "index-root-node" [tag form]
+    (apply mapv vector form))
 
   (defmethod fressian-decode/decode-tagged "index-tdata" [tag form]
     (tagged-literal
