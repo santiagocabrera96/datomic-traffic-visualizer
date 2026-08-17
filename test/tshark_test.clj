@@ -7,25 +7,7 @@
             [tshark])
   (:import (java.util Arrays)))
 
-; A raw tshark record carrying only the :tcp layer -- no :http or :memcache
-; dissection -- like a bare TCP segment (e.g. Syn/Ack/Fin, or a segment whose
-; payload didn't get reassembled into an upper-layer message yet).
-(def tshark-record
-  {:timestamp 1699999999123
-   :layers {:tcp {:tcp_tcp_port             ["8000"]
-                  :tcp_tcp_srcport          "54321"
-                  :tcp_tcp_dstport          "8000"
-                  :tcp_tcp_stream           "0"
-                  :tcp_tcp_len              "0"
-                  :tcp_tcp_payload          ""}}})
-
-(def tshark-lines (for [contents [(slurp "/tmp/tshark.log")]
-                        line (str/split-lines contents)
-                        :let [tshark-record (charred/read-json line :key-fn keyword)]
-                        :when (not (:index tshark-record))]
-                    (update tshark-record :timestamp parse-long)))
-
-
+; TODO: Move to utils namespace
 (defn- some-vals
   "m with nil-valued entries dropped -- same helper tshark.clj's own
    some-vals is, for the same reason: an event map shouldn't carry keys
@@ -33,6 +15,7 @@
   [m]
   (into (empty m) (remove (comp nil? val)) m))
 
+; TODO: Move to utils namespace
 (defn- hex-payload->bytes
   "tshark's colon-hex payload string (e.g. \"78:56:34:12\") as a vector of
    byte values (0-255) instead."
@@ -55,9 +38,6 @@
   (into #{} (keep (fn [[field kw]] (when (true? (get tcp field)) kw))) flag-field->keyword))
 
 (def ^:private flag-order [:URG :ACK :PSH :RST :SYN :FIN])
-
-(defn- flags->tag [flags]
-  (str/join "," (map name (filter flags flag-order))))
 
 (defn tshark->tcp [record]
   (when-let [tcp (get-in record [:layers :tcp])]
@@ -86,9 +66,26 @@
   [x]
   (cond (nil? x) [] (sequential? x) (vec x) :else [x]))
 
+(def opcode->command
+  {0x00 :get 0x01 :set 0x02 :add 0x03 :replace 0x04 :delete 0x05 :incr 0x06 :decr
+   0x07 :quit 0x08 :flush-all 0x09 :get 0x0b :version 0x0c :get 0x0d :get
+   0x0e :append 0x0f :prepend 0x10 :stats 0x11 :set 0x12 :add 0x13 :replace
+   0x14 :delete 0x15 :incr 0x16 :decr 0x17 :quit 0x18 :flush-all 0x19 :append
+   0x1a :prepend 0x1b :verbosity 0x1c :touch 0x1d :gat 0x1e :gat})
+(def status->outcome
+  {0x00 :ok
+   0x01 :not-found
+   0x02 :exists
+   0x03 :server-error
+   0x04 :client-error
+   0x05 :not-stored
+   0x06 :client-error
+   0x81 :error
+   0x82 :server-error
+   0x83 :server-error})
 (defn tshark-tcp->memcache [tcp-event]
-  (let [memcache (get-in tcp-event [:layers :memcache])
-        payload  (get-in tcp-event [:tcp :payload])
+  (let [{{memcache           :memcache
+          {payload :payload} :tcp} :layers} tcp-event
         ms       (->vec memcache)
         pdu-lens (map #(+ 24 (parse-long (:memcache_memcache_total_body_length %))) ms)
         offsets  (reductions + 0 pdu-lens)]
@@ -97,8 +94,8 @@
                 extras    (parse-long (:memcache_memcache_extras_length m))
                 key-len   (parse-long (:memcache_memcache_key_length m))
                 k         (:memcache_memcache_key m)
-                operation (tshark/opcode->command (parse-long (:memcache_memcache_opcode m)) :unknown)
-                status    (some->> (:memcache_memcache_status m) parse-long tshark/status->outcome)
+                operation (opcode->command (parse-long (:memcache_memcache_opcode m)) :unknown)
+                status    (some->> (:memcache_memcache_status m) parse-long status->outcome)
                 from      (+ offset 24 extras key-len)
                 to        (+ offset 24 total)
                 payload   (when (and payload (< from to) (<= to (count payload)))
@@ -114,6 +111,7 @@
   "tshark's hex-encoded http.file_data, decoded from hex and JSON-parsed --
    nil if there's no body, or it doesn't parse as JSON."
   [http]
+  ; TODO: This function should be called with the byte-array directly to be usable elsewhere.
   (let [body-bytes (byte-array (hex-payload->bytes (:http_http_file_data http)))]
     (when (pos? (alength body-bytes))
       (try (charred/read-json (String. body-bytes "UTF-8") :key-fn keyword)
@@ -127,21 +125,22 @@
         (->vec lines)))
 
 (defn tshark-tcp->http [tcp-event]
-  (when-let [http (get-in tcp-event [:layers :http])]
+  (let [{{http :http} :layers} tcp-event]
     (let [request-method (some-> (:http_http_request_method http) str/lower-case keyword)
           uri            (:http_http_request_uri http)
           headers        (parse-headers (or (:http_http_request_line http)
                                             (:http_http_response_line http)))
           status         (some-> (:http_http_response_code http) parse-long)
+          ; TODO: Parse of body as json should only be made if the content-type header is json related.
           body           (json-body http)]
-      [(assoc tcp-event
-         :protocol :http
-         :http     (some-vals
-                     {:request-method request-method
-                      :uri            uri
-                      :headers        headers
-                      :status         status
-                      :body           body}))])))
+      (assoc tcp-event
+        :protocol :http
+        :http     (some-vals
+                    {:request-method request-method
+                     :uri            uri
+                     :headers        headers
+                     :status         status
+                     :body           body})))))
 
 (defn- dynamo-operation
   "DynamoDB's operation name, e.g. \"PutItem\" -- the part of the
@@ -157,16 +156,17 @@
           first val))
 
 (defn http->dynamo [http-event]
-  (let [{:keys [headers body]} (:http http-event)
+  (let [{:keys [headers body status]} (:http http-event)
         operation (dynamo-operation headers)
         decoded   body
         k         (dynamo-key decoded)]
-    [(assoc http-event
-       :protocol :dynamodb
-       :dynamo   (some-vals
-                   {:operation operation
-                    :key       k
-                    :body      decoded}))]))
+    (assoc http-event
+      :protocol :dynamodb
+      :dynamo   (some-vals
+                  {:operation operation
+                   :key       k
+                   :status    status
+                   :body      decoded}))))
 
 (defmulti decode-protocol
   (fn [protocol _record] protocol))
@@ -182,10 +182,10 @@
 (defmethod decode-protocol :http [_ record]
   (->> (decode-protocol :tcp record)
        (filter (comp :http :layers))
-       (mapcat tshark-tcp->http)))
+       (map tshark-tcp->http)))
 
 (defmethod decode-protocol :dynamodb [_ record]
-  (mapcat http->dynamo (decode-protocol :http record)))
+  (map http->dynamo (decode-protocol :http record)))
 
 (defmulti draw
   "Given a drawable event (see diagram/write-svg!) whose semantic detail
@@ -196,15 +196,19 @@
    by the protocol parsers above."
   :protocol)
 
+(defn- flags->tag [flags]
+  (str/join "," (map name (filter flags flag-order))))
 (defmethod draw :tcp [event]
-  (assoc event
-    :tag  (flags->tag (get-in event [:tcp :flags]))
-    :note (String. (get-in event [:tcp :payload]))))
+  (let [{:keys [flags payload]} (:tcp event)]
+    (assoc event
+      :tag (flags->tag flags)
+      :note (String. payload))))
 
 (defmethod draw :memcache [event]
-  (assoc event
-    :tag (str (name (get-in event [:memcache :operation])) " " (get-in event [:memcache :key]))
-    :note (get-in event [:memcache :payload])))
+  (let [{:keys [key operation payload]} (:memcache event)]
+    (assoc event
+      :tag (str (name operation) " " key)
+      :note payload)))
 
 (defmethod draw :http [event]
   (let [{:keys [request-method uri status headers body]} (:http event)]
@@ -214,11 +218,13 @@
              :body body})))
 
 (defmethod draw :dynamodb [event]
-  (let [{:keys [operation key body]} (:dynamo event)]
+  (let [{:keys [operation key body status]} (:dynamo event)]
     (assoc event
-      :tag  (if operation (str operation " " key) (str (get-in event [:http :status])))
+      :tag  (if operation (str operation " " key) (str status))
       :note body)))
 
+; TODO: remove-noise should receive the protocol-ports as parameter to pass to request? Or inline the call.
+; TODO: rename :dstport keyword usage to be dst-port.
 (defn- request? [event] (contains? tshark/protocol-ports (:dstport event)))
 
 (defn remove-noise
@@ -258,6 +264,7 @@
               (rf result e))))))))
   ([noisy? events] (sequence (remove-noise noisy?) events)))
 
+; TODO: Move to utils namespace
 (defn- unpack-7bit-lsb [^String s]
   (let [n (count s)
         nbytes (quot (* 7 n) 8)
@@ -271,10 +278,12 @@
                 (aset out byte-idx (unchecked-byte (bit-or (bit-and 0xff (aget out byte-idx))
                                                            (bit-shift-left 1 bit-in-byte))))))))))
     out))
+; TODO: Move to utils namespace
 (defn update-in-if-present [m ks f]
   (if (not= ::missing (get-in m ks ::missing))
     (update-in m ks f)
     m))
+
 (defn decode-datomic [event]
   (cond
     (seq (:payload (:memcache event)))
@@ -304,12 +313,19 @@
   (defn- noisy? [event]
     (#{"pod-coord"} (get-in event [:dynamo :key])))
 
+  (def tshark-lines (for [contents [(slurp "/tmp/tshark.log")]
+                          line (str/split-lines contents)
+                          :let [tshark-record (charred/read-json line :key-fn keyword)]
+                          :when (not (:index tshark-record))]
+                      (update tshark-record :timestamp parse-long)))
+
   (def events
     (->> tshark-lines
          (mapcat #(decode-protocol (tshark->protocol % {8000 :http
                                                         11211 :memcache}) %))
          (remove-noise noisy?)
          (map decode-datomic)))
+
   (diagram/write-svg! (map draw events) "/tmp/tshark.log.svg"
                       {:port-names port-names :protocol-styles protocol-styles})
 
