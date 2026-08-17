@@ -342,6 +342,28 @@
      :tcp      {:color "#D3D3D3" :label "TCP"}
      :http     {:color "#94C9FF" :label "HTTP"}})
 
+  (remove-method fressian-decode/decode-tagged "index-tdata")
+  (remove-method fressian-decode/decode-tagged "index-dir-node")
+  (remove-method fressian-decode/decode-tagged "index-root-node")
+
+  (defmethod fressian-decode/decode-tagged "index-tdata" [tag form]
+    (tagged-literal
+      (symbol tag)
+      (let [[v e a t added] form]
+        (mapv #(zipmap [:e :a :v :t :added]  %&) e a v t added))))
+
+  (defmethod fressian-decode/decode-tagged "index-dir-node" [tag form]
+    (tagged-literal
+      (symbol tag)
+      (let [[index-tdata segment-id _ datom-count] form]
+        (mapv #(zipmap [:first-datom :seg-id :datom-count] %&) (:form index-tdata) segment-id datom-count))))
+
+  (defmethod fressian-decode/decode-tagged "index-root-node" [tag form]
+    (tagged-literal
+      (symbol tag)
+      (let [[index-tdata dir-id] form]
+        (mapv #(zipmap [:first-datom :dir-id] %&) (:form index-tdata) dir-id))))
+
   ;; `draw` is called here, once, right before handing events to write-svg! --
   ;; not by any of the protocol parsers above.
   (diagram/write-svg! (map draw tcp-events) "/tmp/tcp.svg"

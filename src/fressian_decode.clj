@@ -5,58 +5,43 @@
            (java.util.zip GZIPInputStream)
            (org.fressian TaggedObject)))
 
-(def ^:private tag-column-keys
-  {"index-tdata"    [:v :e :a :t :added]
-   "index-dir-node" [:first-datom :id :_ :datom-count]
-   "index-root-node" [:first-datom :id]})
+(defmulti decode-tagged
+  "Decodes one fressian TaggedObject's already-taggified values (`form`, the
+   vector of its component values) into a tag-specific representation --
+   dispatches on `tag` (the fressian tag string). Register a method here to
+   give a specific tag richer structure than the default (e.g. zip-columns
+   below, reconstructing parallel column arrays into row maps); the default
+   unwraps a single-value form and wraps whatever's left in a plain
+   tagged-literal, mirroring TaggedObject's own shape."
+  (fn [tag _form] tag))
 
-(defn- unwrap-col
-  "A column may itself arrive as a tagged literal (e.g. a nested
-   #index-data); the actual column values are its :form."
-  [c]
-  (if (tagged-literal? c) (:form c) c))
+(defmethod fressian-decode/decode-tagged "index-tdata" [tag form]
+  (tagged-literal
+    (symbol tag)
+    (let [[v e a t added] form]
+      (mapv #(zipmap [:e :a :v :t :added]  %&) e a v t added))))
 
-(defn- as-columns
-  "Fressian sometimes hands the columns straight across as separate tag
-   components (cs already has one seq per key), and sometimes wraps them all
-   in a single nested collection. Normalize to a plain seq of column
-   collections either way, unwrapping any individually tagged columns."
-  [cs ks]
-  (let [cs (mapv unwrap-col cs)]
-    (if (or (= (count cs) (count ks)) (not= 1 (count cs)))
-      cs
-      (first cs))))
+(defmethod fressian-decode/decode-tagged "index-dir-node" [tag form]
+  (tagged-literal
+    (symbol tag)
+    (let [[index-tdata segment-id _ datom-count] form]
+      (mapv #(zipmap [:first-datom :seg-id :datom-count] %&) (:form index-tdata) segment-id datom-count))))
 
-(assert
-  (= (as-columns
-       [(tagged-literal 'index-data [{:v 0, :e 0, :a 11, :t 54, :added true}]) [#uuid "6a77db06-93d3-42c4-a3b6-59f8aee851db"] [0] [123]]
-       [:first-datom :id :unknown :datom-count])
-     [[{:v 0, :e 0, :a 11, :t 54, :added true}] [#uuid "6a77db06-93d3-42c4-a3b6-59f8aee851db"] [0] [123]]))
-
-(assert
-  (= (as-columns
-       [(tagged-literal 'index-data [{:v 0, :e 0, :a 11, :t 54, :added true}]) [#uuid "6a77db06-93d3-42c4-a3b6-59f8aee851db"] [0] [123]]
-       [:first-datom :id :unknown :datom-count])
-     [[{:v 0, :e 0, :a 11, :t 54, :added true}] [#uuid "6a77db06-93d3-42c4-a3b6-59f8aee851db"] [0] [123]]))
-
-(defn- zip-columns
-  "Zip a tag's parallel column arrays into an array of structs keyed by ks."
-  [ks cs]
-  (apply mapv #(zipmap ks %&) (as-columns cs ks)))
+(defmethod fressian-decode/decode-tagged "index-root-node" [tag form]
+  (tagged-literal
+    (symbol tag)
+    (let [[index-tdata dir-id] form]
+      (mapv #(zipmap [:first-datom :dir-id] %&) (:form index-tdata) dir-id))))
 
 (defn- taggify
-  "Recursively replace org.fressian.TaggedObject with clojure tagged literals,
-   normalizing the java collections fressian hands back into clojure ones."
+  "Recursively replace org.fressian.TaggedObject with clojure tagged literals
+   (see decode-tagged), normalizing the java collections fressian hands back
+   into clojure ones."
   [x]
   (cond
     (instance? TaggedObject x)
-    (let [^TaggedObject t x
-          tag (str (.getTag t))
-          cs (mapv taggify (.getValue t))]
-      (tagged-literal (symbol tag)
-                      (if-let [ks (tag-column-keys tag)]
-                        (zip-columns ks cs)
-                        (if (= 1 (count cs)) (first cs) cs))))
+    (let [^TaggedObject t x]
+      (decode-tagged (str (.getTag t)) (mapv taggify (.getValue t))))
 
     (record? x) (reduce-kv (fn [r k v] (assoc r k (taggify v))) x x)
     (map? x) (reduce-kv (fn [m k v] (assoc m (taggify k) (taggify v))) {} x)
