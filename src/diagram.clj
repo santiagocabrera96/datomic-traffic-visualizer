@@ -30,8 +30,8 @@
    (e.g. built by a caller that doesn't have ports) is left alone."
   [port-names event]
   (cond-> event
-    (not (contains? event :from)) (assoc :from (resolve-port port-names (:srcport event)))
-    (not (contains? event :to))   (assoc :to   (resolve-port port-names (:dstport event)))))
+          (not (contains? event :from)) (assoc :from (resolve-port port-names (:src-port event)))
+          (not (contains? event :to)) (assoc :to (resolve-port port-names (:dst-port event)))))
 
 (def ^:private default-max-line-length 80)
 
@@ -287,9 +287,9 @@
   ;; :port-names resolves them (a port missing from the map renders as
   ;; :unknown-<port>).
   (def raw-events
-    [{:srcport 49515 :dstport 8000 :timestamp 1 :tag "PutItem foo"
-      :note {:Item {:id "foo" :value 42}}}
-     {:srcport 8000 :dstport 49515 :timestamp 2 :tag "200"}])
+    [{:src-port 49515 :dst-port 8000 :timestamp 1 :tag "PutItem foo"
+      :note     {:Item {:id "foo" :value 42}}}
+     {:src-port 8000 :dst-port 49515 :timestamp 2 :tag "200"}])
   (println (events->plantuml raw-events {:port-names {8000 :dynamodb}}))
 
   ;; A title, a custom arrow label, and grouping a run of events under a

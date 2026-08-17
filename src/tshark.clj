@@ -119,8 +119,8 @@
     (some-vals {:protocol       :dynamodb
                 :timestamp      timestamp
                 :stream         (->long (:tcp_tcp_stream tcp))
-                :srcport        (->long (:tcp_tcp_srcport tcp))
-                :dstport        (->long (:tcp_tcp_dstport tcp))
+                :src-port       (->long (:tcp_tcp_srcport tcp))
+                :dst-port       (->long (:tcp_tcp_dstport tcp))
                 :request-method request-method
                 :operation      (dynamo-operation request-line)
                 :key            (dynamo-key body)
@@ -227,8 +227,8 @@
         {:protocol  :memcache
          :timestamp timestamp
          :stream    (->long (:tcp_tcp_stream tcp))
-         :srcport   (->long (:tcp_tcp_srcport tcp))
-         :dstport   (->long (:tcp_tcp_dstport tcp))
+         :src-port  (->long (:tcp_tcp_srcport tcp))
+         :dst-port  (->long (:tcp_tcp_dstport tcp))
          :operation (opcode->command (->long (:memcache_memcache_opcode memcache)) :unknown)
          :status    (status->outcome (->long (:memcache_memcache_status memcache)))
          :key       (:memcache_memcache_key memcache)
@@ -264,7 +264,7 @@
 
 (def protocol-ports
   (into #{} (map (comp parse-long :port val)) protocols))
-(defn- request? [event] (contains? protocol-ports (:dstport event)))
+(defn- request? [event] (contains? protocol-ports (:dst-port event)))
 
 (defn remove-noise
   "Stateful transducer: drops requests matching `noisy?` -- a predicate over
