@@ -10,7 +10,10 @@
   (:require [charred.api :as charred]
             [clojure.edn :as edn]
             [clojure.string :as str]
+            [dynamodb]
             [fressian-decode]
+            [http]
+            [memcache]
             [tshark :refer [decode-protocol read-tshark remove-noise]]
             [utils :refer [some-vals hex-payload->bytes update-in-if-present unpack-7bit-lsb ->vec]]))
 
@@ -64,14 +67,48 @@
                             (comp (partial fressian-decode/decode-body readers) unpack-7bit-lsb))
 
      :else event)))
-; TODO: Make this namespace the place where we'll call from demo.clj to read the file
-;; parse as dynamodb and memcache, and parse-datomic specific known shapes.
-;; The parameters should be the port->protocol functions to decide which protocol to use,
-;; the available ones should be :tcp :http :dynamodb and :memcache.
-;; It should optionally receive the file, content, whatever about the ports and regions file.
-;; Initially only the tshark log file.
+
+(def datomic-index-readers
+  {"index-tdata"
+   (fn [tag form]
+     (tagged-literal
+       (symbol tag)
+       (let [[v e a t added] form]
+         (mapv #(zipmap [:e :a :v :t :added] %&) e a v t added))))
+
+   "index-dir-node"
+   (fn [tag form]
+     (tagged-literal
+       (symbol tag)
+       (let [[index-tdata segment-id _ datom-count] form]
+         (mapv #(zipmap [:first-datom :seg-id :datom-count] %&) (:form index-tdata) segment-id datom-count))))
+
+   "index-root-node"
+   (fn [tag form]
+     (tagged-literal
+       (symbol tag)
+       (let [[index-tdata dir-id] form]
+         (mapv #(zipmap [:first-datom :dir-id] %&) (:form index-tdata) dir-id))))})
+
+(defn read-datomic-capture
+  "Reads `tshark-log` (path or raw content -- see read-tshark), decodes it
+   per `port->protocol` (values must each name a registered decode-protocol
+   method -- :tcp/:http/:dynamodb/:memcache are registered by tshark/http/
+   dynamodb/memcache respectively; defaults to this demo's ports), drops the
+   transactor's own pod-coord/pod-standby heartbeat traffic, and decodes
+   Datomic's known fressian shapes (see decode-datomic-known-shapes;
+   `readers` customizes e.g. index-tdata decoding). `since`/`until` are
+   passed straight through to read-tshark. This is what demo.clj calls.
+   Doesn't yet touch ports/regions files -- callers still resolve :from/:to
+   (attach-participants) and diagram regions themselves."
+  [tshark-log & {:keys [readers port->protocol since until]
+                 :or   {readers datomic-index-readers port->protocol {8000 :dynamodb 11211 :memcache}}}]
+  (->> (read-tshark tshark-log :port->protocol port->protocol :since since :until until)
+       (remove-noise (comp #{"pod-coord" "pod-standby"} :key :dynamodb))
+       (map (partial decode-datomic-known-shapes readers))))
+
 (comment
-  (require '[diagram] '[memcache] '[http] '[dynamodb])
+  (require '[diagram])
   ; Read tshark, try to decode per protocol if it has port->protocol, otherwise parse as :tcp.
   ; Remove noise, assuming request/response in order.
   ; Decode datomic known shapes.

@@ -1,6 +1,8 @@
 (require '[setup :refer :all]
+         '[clojure.edn :as edn]
          '[datomic.api :as d]
-         '[tshark])
+         '[datomic-caching :refer [read-datomic-capture event->draw attach-participants]]
+         '[diagram])
 
 ;; pids/port-owners only make sense once all three processes exist, so
 ;; there's no partial start. TSHARK_LOG lets scripts/capture.sh's own log
@@ -78,7 +80,17 @@
 
 ;; Render the capture into a sequence diagram. :since skips DynamoDB
 ;; Local/memcached/transactor startup noise below `session`'s start time.
-(tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
+;; port-names (port -> :dynamodb/:memcached/:transactor/:peer) and regions
+;; ([{:label ... :start ... :end ...}], one per `region` call above) are
+;; start-all!'s live sweeps, each dumped to disk on every change -- read
+;; back from :ports-path/:regions-path so they reflect the whole run, not
+;; just whatever was known when start-all! returned `session`.
+(def events (read-datomic-capture (:tshark-log session) :since (:since session)))
+(def port-names (edn/read-string (slurp (:ports-path session))))
+(def diagram-regions (edn/read-string (slurp (:regions-path session))))
+(diagram/write-svg! (map (comp event->draw (partial attach-participants port-names)) events)
+                     (str (:tshark-log session) ".svg")
+                     {:regions diagram-regions})
 
 ;; Tear the stack down -- stop tshark's capture (Ctrl-C, in its own
 ;; terminal) before or after this, it doesn't matter.
