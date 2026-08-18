@@ -378,17 +378,19 @@
         regions-path    (str tshark-log-file ".regions.edn")
         file-port-names (read-edn-if-exists ports-path)
         regions         (read-edn-if-exists regions-path)
+        styles          (merge default-protocol-styles protocol-styles)
         events          (with-open [rdr (io/reader tshark-log-file)]
                           (->> (line-seq rdr)
                                (parse-tshark since)
                                (parse-datomic-traffic)
                                (remove-noise noisy?)
+                               (map #(assoc % :color (get-in styles [(:protocol %) :color])))
                                (into [])))]
     (diagram/write-svg! events svg-path
                          (merge {:regions regions}
                                 (dissoc opts :svg-path :since :noisy? :port-names :protocol-styles)
-                                {:port-names      (merge default-port-names file-port-names port-names)
-                                 :protocol-styles (merge default-protocol-styles protocol-styles)}))))
+                                {:port-names (merge default-port-names file-port-names port-names)
+                                 :legend     (vals styles)}))))
 
 (comment
   (draw-diagram! "/tmp/tshark.log")

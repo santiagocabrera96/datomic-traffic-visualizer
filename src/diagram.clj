@@ -144,27 +144,29 @@
   [{:keys [tag]}]
   (str tag))
 
-(defn- event-color [protocol-styles event]
-  (:color (protocol-styles (:protocol event))))
+(def ^:private default-color "#D3D3D3")
+
+(defn- event-color [event]
+  (or (:color event) default-color))
 
 (defn- legend-lines
-  "One `|<back:color>    </back>| label |` row per entry in `protocol-styles`
-   ({protocol -> {:color \"#...\" :label \"...\"}})."
-  [protocol-styles]
-  (for [[_ {:keys [color label]}] protocol-styles]
+  "One `|<back:color>    </back>| label |` row per entry in `legend`
+   ([{:color \"#...\" :label \"...\"} ...])."
+  [legend]
+  (for [{:keys [color label]} legend]
     (format "|<back:%s>    </back>| %s |" color label)))
 
 (defn- event->plantuml
-  [label-fn protocol-styles max-line-length event]
+  [label-fn max-line-length event]
   (let [[from to] (map fmt-participant [(:from event) (:to event)])
         lines     (note-lines event)
-        color     (event-color protocol-styles event)]
+        color     (event-color event)]
     (str/join "\n"
               (remove nil?
-                      [(format "\"%s\" -> \"%s\"%s: %s" from to (if color (str " " color) "")
+                      [(format "\"%s\" -> \"%s\" %s: %s" from to color
                                (strip-invalid-xml-chars (label-fn event)))
                        (when (seq lines)
-                         (format "note over \"%s\", \"%s\"%s: %s" from to (if color (str " " color) "")
+                         (format "note over \"%s\", \"%s\" %s: %s" from to color
                                  (fmt-note max-line-length lines)))]))))
 
 (defn- region-for
@@ -216,17 +218,16 @@
                             renders as :unknown-<port>
           :regions         [{:label \"...\" :start ms :end ms}]  wraps events whose
                             :timestamp falls in [:start :end] in `group :label ... end`
-          :protocol-styles {protocol -> {:color \"#...\" :label \"...\"}}  colors
-                            that protocol's arrows/notes and lists it in the
-                            legend; a protocol missing from it gets no color
-                            and no legend line
+          :legend          [{:color \"#...\" :label \"...\"} ...]  legend rows;
+                            each event's own :color styles its arrow/note
+                            (falling back to a default gray when absent)
           :max-line-length n                       PlantUML's skinparam wrapWidth,
                             in pixels-per-character terms -- note/message text
                             wraps at word boundaries around n characters wide
                             (default 80)}"
   ([events] (events->plantuml events nil))
-  ([events {:keys [title label-fn regions port-names protocol-styles max-line-length]
-            :or   {label-fn default-label port-names {} protocol-styles {}
+  ([events {:keys [title label-fn regions port-names legend max-line-length]
+            :or   {label-fn default-label port-names {} legend []
                    max-line-length default-max-line-length}}]
    (let [events       (->> events (sort-by :timestamp) (map (partial attach-participants port-names)))
          participants (->> events (mapcat (juxt :from :to)) distinct (map fmt-participant))]
@@ -238,9 +239,9 @@
                          (when title [(str "title " title)])
                          ["autonumber"]
                          (map #(format "participant \"%s\"" %) participants)
-                         (grouped-lines regions events (map #(event->plantuml label-fn protocol-styles max-line-length %) events))
-                         (when (seq (legend-lines protocol-styles))
-                           (concat ["legend top left"] (legend-lines protocol-styles) ["endlegend"]))
+                         (grouped-lines regions events (map #(event->plantuml label-fn max-line-length %) events))
+                         (when (seq (legend-lines legend))
+                           (concat ["legend top left"] (legend-lines legend) ["endlegend"]))
                          ["@enduml"]))))))
 
 (defn write-diagram!
@@ -300,17 +301,17 @@
                               :label-fn   :tag
                               :regions    [{:label "warmup" :start 0 :end 1}]}))
 
-  ;; Coloring/legend: pass :protocol-styles -- see dynamodb and memcache for
-  ;; the real ones.
-  (println (events->plantuml (map #(assoc % :protocol :dynamodb) raw-events)
-                             {:port-names      {8000 :dynamodb}
-                              :protocol-styles {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}}}))
+  ;; Coloring/legend: each event carries its own :color; :legend is just the
+  ;; rows to list underneath.
+  (println (events->plantuml (map #(assoc % :color "#FFAEFB") raw-events)
+                             {:port-names {8000 :dynamodb}
+                              :legend     [{:color "#FFAEFB" :label "Storage (DynamoDB)"}]}))
 
   ;; Write straight to a .puml source file, or render straight to SVG --
   ;; both take the same opts as events->plantuml.
   (write-diagram! events "/tmp/events.puml")
   (write-svg! events "/tmp/events.svg" {:port-names {8000 :dynamodb}})
-  (write-svg! (map #(assoc % :protocol :dynamodb) events) "/tmp/events.svg" {:port-names {8000 :dynamodb}})
+  (write-svg! (map #(assoc % :color "#FFAEFB") events) "/tmp/events.svg" {:port-names {8000 :dynamodb}})
 
   ;; The whole real pipeline lives in process -- it reads a tshark log
   ;; via protocol/read-messages, then calls write-svg! with the ports
