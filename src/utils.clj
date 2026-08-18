@@ -1,6 +1,10 @@
 (ns utils
   (:require [clojure.string :as str]))
 
+(defn ->vec
+  [x]
+  (cond (nil? x) [] (sequential? x) (vec x) :else [x]))
+
 (defn some-vals
   "m with nil-valued entries dropped -- an event map shouldn't carry keys
    that don't apply to it (e.g. :status on a request)."
@@ -32,3 +36,5 @@
                 (aset out byte-idx (unchecked-byte (bit-or (bit-and 0xff (aget out byte-idx))
                                                            (bit-shift-left 1 bit-in-byte))))))))))
     out))
+
+; TODO: Create rich comment block of the code here.

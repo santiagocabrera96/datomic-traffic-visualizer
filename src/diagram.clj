@@ -1,7 +1,7 @@
 (ns diagram
   "Renders a PlantUML sequence diagram from a timestamp-sorted log of traffic
-   events (flat maps with :srcport/:dstport -- :from/:to participant names
-   are resolved here from opts' :port-names)."
+   events (flat maps that already carry :from/:to participant names, which
+   dictate the arrow's direction)."
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pp]
             [clojure.string :as str])
@@ -17,21 +17,6 @@
 
 (defn- fmt-participant [x]
   (if (keyword? x) (name x) (str x)))
-
-(defn- resolve-port
-  "port-names entry for `port`, or :unknown-<port> when it's not in the map --
-   e.g. a port never swept by setup's port-owner watcher."
-  [port-names port]
-  (port-names port (keyword (str "unknown-" port))))
-
-(defn- attach-participants
-  "Fills in an event's :from/:to from its :srcport/:dstport via port-names,
-   but only when missing -- an event that already names its participants
-   (e.g. built by a caller that doesn't have ports) is left alone."
-  [port-names event]
-  (cond-> event
-          (not (contains? event :from)) (assoc :from (resolve-port port-names (:src-port event)))
-          (not (contains? event :to)) (assoc :to (resolve-port port-names (:dst-port event)))))
 
 (def ^:private default-max-line-length 80)
 
@@ -206,16 +191,12 @@
                          true (conj line))))))))
 
 (defn events->plantuml
-  "events need not be pre-sorted; sorted by :timestamp here. Any event
-   missing :from/:to gets them resolved from its :srcport/:dstport via opts'
-   :port-names; an event that already has :from/:to is left alone.
+  "events need not be pre-sorted; sorted by :timestamp here. Each event's
+   :from/:to (which dictate the arrow's direction) must already be set by
+   the caller.
 
    opts: {:title           \"...\"                 diagram title
           :label-fn        (fn [event] \"...\")    arrow label, defaults to `default-label`
-          :port-names      {port -> name}          resolves :srcport/:dstport into
-                            participant names (e.g. setup's port-owners map)
-                            for events missing :from/:to; a port missing from it
-                            renders as :unknown-<port>
           :regions         [{:label \"...\" :start ms :end ms}]  wraps events whose
                             :timestamp falls in [:start :end] in `group :label ... end`
           :legend          [{:color \"#...\" :label \"...\"} ...]  legend rows;
@@ -226,10 +207,10 @@
                             wraps at word boundaries around n characters wide
                             (default 80)}"
   ([events] (events->plantuml events nil))
-  ([events {:keys [title label-fn regions port-names legend max-line-length]
-            :or   {label-fn default-label port-names {} legend []
+  ([events {:keys [title label-fn regions legend max-line-length]
+            :or   {label-fn default-label legend []
                    max-line-length default-max-line-length}}]
-   (let [events       (->> events (sort-by :timestamp) (map (partial attach-participants port-names)))
+   (let [events       (sort-by :timestamp events)
          participants (->> events (mapcat (juxt :from :to)) distinct (map fmt-participant))]
      (str/join "\n"
                (remove nil?
@@ -284,36 +265,24 @@
      {:from :dynamodb :to :peer :timestamp 2 :tag "200"}])
   (println (events->plantuml events))
 
-  ;; Same events, but naming participants by :srcport/:dstport instead --
-  ;; :port-names resolves them (a port missing from the map renders as
-  ;; :unknown-<port>).
-  (def raw-events
-    [{:src-port 49515 :dst-port 8000 :timestamp 1 :tag "PutItem foo"
-      :note     {:Item {:id "foo" :value 42}}}
-     {:src-port 8000 :dst-port 49515 :timestamp 2 :tag "200"}])
-  (println (events->plantuml raw-events {:port-names {8000 :dynamodb}}))
-
   ;; A title, a custom arrow label, and grouping a run of events under a
   ;; `group ... end` block (as produced by setup's `region` macro).
-  (println (events->plantuml raw-events
-                             {:port-names {8000 :dynamodb}
-                              :title      "Demo"
-                              :label-fn   :tag
-                              :regions    [{:label "warmup" :start 0 :end 1}]}))
+  (println (events->plantuml events
+                             {:title    "Demo"
+                              :label-fn :tag
+                              :regions  [{:label "warmup" :start 0 :end 2}]}))
 
   ;; Coloring/legend: each event carries its own :color; :legend is just the
   ;; rows to list underneath.
-  (println (events->plantuml (map #(assoc % :color "#FFAEFB") raw-events)
-                             {:port-names {8000 :dynamodb}
-                              :legend     [{:color "#FFAEFB" :label "Storage (DynamoDB)"}]}))
+  (println (events->plantuml (map #(assoc % :color "#FFAEFB") events)
+                             {:legend [{:color "#FFAEFB" :label "Storage (DynamoDB)"}]}))
 
   ;; Write straight to a .puml source file, or render straight to SVG --
   ;; both take the same opts as events->plantuml.
   (write-diagram! events "/tmp/events.puml")
-  (write-svg! events "/tmp/events.svg" {:port-names {8000 :dynamodb}})
-  (write-svg! (map #(assoc % :color "#FFAEFB") events) "/tmp/events.svg" {:port-names {8000 :dynamodb}})
+  (write-svg! events "/tmp/events.svg")
 
-  ;; The whole real pipeline lives in process -- it reads a tshark log
-  ;; via protocol/read-messages, then calls write-svg! with the ports
-  ;; file's port-names and (optionally) setup's regions.
+  ;; The whole real pipeline lives in process -- it reads a tshark log,
+  ;; resolves :from/:to from ports itself, then calls write-svg! with
+  ;; (optionally) setup's regions.
   )
