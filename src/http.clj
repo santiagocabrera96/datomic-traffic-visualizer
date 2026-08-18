@@ -30,11 +30,9 @@
           body-bytes     (byte-array (hex-payload->bytes (:http_http_file_data http)))
           body           (when (json-content-type? headers) (json-body body-bytes))]
       (assoc tcp-event
-        :type :http
         :http (some-vals
                 {:request-method request-method
                  :uri            uri
                  :headers        headers
                  :status         status
                  :body           body})))))
-

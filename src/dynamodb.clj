@@ -20,7 +20,6 @@
         decoded   body
         k         (dynamo-key decoded)]
     (assoc http-event
-      :type :dynamodb
       :dynamodb (some-vals
                   {:operation operation
                    :key       k

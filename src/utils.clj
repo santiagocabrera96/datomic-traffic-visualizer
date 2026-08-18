@@ -37,4 +37,16 @@
                                                            (bit-shift-left 1 bit-in-byte))))))))))
     out))
 
-; TODO: Create rich comment block of the code here.
+(comment
+  (->vec nil)
+  (->vec [1 2])
+  (->vec {:a 1})
+
+  (some-vals {:a 1 :b nil :c 2})
+
+  (hex-payload->bytes "78:56:34:12")
+
+  (update-in-if-present {:a {:b 1}} [:a :b] inc)
+  (update-in-if-present {:a {}} [:a :b] inc)
+
+  (unpack-7bit-lsb ""))

@@ -1,17 +1,18 @@
 (ns tshark
-  "Turns a tshark capture log into decoded Datomic-traffic events and an SVG
-   sequence diagram -- see draw-diagram!. Understands known protocols
-   (dynamodb over http, memcache over tcp), splits grouped packets into
-   individual protocol messages, decodes bytearrays (7-bit LSB packed
-   strings, or hex strings like \"XX:XX:XX:XX\"), and fressian/edn-decodes
-   their bodies."
+  "Parses a tshark -T json capture log into TCP-layer events -- see
+   read-tshark. `decode-protocol` is an open multimethod dispatching on
+   protocol keyword; only :tcp (and :default, which just falls back to :tcp)
+   are registered here. Protocol-specific decoding (memcache, http, dynamodb),
+   plus drawing/participant-naming/Datomic-body-decoding, are layered on top
+   by registering more decode-protocol methods elsewhere -- see
+   test/tshark_test.clj for the real pipeline."
   (:require [charred.api :as charred]
-            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.walk :as walk]
-            [diagram :as diagram]
             [fressian-decode]
+            [memcache :refer [tshark-tcp->memcache]]
+            [http :refer [tshark-tcp->http]]
+            [dynamodb :refer [http->dynamodb]]
             [utils :refer [some-vals hex-payload->bytes update-in-if-present unpack-7bit-lsb]]))
 
 (def ^:private flag-field->keyword
@@ -37,7 +38,6 @@
           len (parse-long (:tcp_tcp_len tcp))
           stream (parse-long (:tcp_tcp_stream tcp))]
       [(assoc record
-         :type :tcp
          :tcp {:src-port src-port
                :dst-port dst-port
                :stream   stream
@@ -52,6 +52,19 @@
 
 (defmethod decode-protocol :default [_ record]
   (decode-protocol :tcp record))
+
+(defmethod decode-protocol :memcache [_ record]
+  (->> (decode-protocol :tcp record)
+       (filter (comp :memcache :layers))
+       (mapcat tshark-tcp->memcache)))
+
+(defmethod decode-protocol :http [_ record]
+  (->> (decode-protocol :tcp record)
+       (filter (comp :http :layers))
+       (map tshark-tcp->http)))
+
+(defmethod decode-protocol :dynamodb [_ record]
+  (map http->dynamodb (decode-protocol :http record)))
 
 (defn read-tshark
   "Parse tshark lines from `f`, but will guess the server port and parse the
@@ -124,16 +137,24 @@
   ([noisy? events] (sequence (remove-noise noisy?) events)))
 
 (comment
-  ; TODO: Update Rich comment block.
-  (draw-diagram! "/tmp/tshark.log")
-  (draw-diagram! "/tmp/tshark.log" {:svg-path "/tmp/events.svg"})
-  (draw-diagram! "/tmp/tshark.log" {:noisy? (constantly false)})
-  (draw-diagram! "/tmp/tshark.log" {:port-names {49515 :peer}})
-  (draw-diagram! "/tmp/tshark.log" {:since (- (System/currentTimeMillis) 10000000)})
+  ; TODO: Add example on how to implement another protocol.
+  ; TODO: Examples should not assume a file "/tmp/tshark.log" exists.
 
-  ;; The decoded event maps draw-diagram! would otherwise turn straight into
-  ;; an SVG -- handy at the REPL to inspect/filter/tally without generating
-  ;; a diagram at all.
-  (def events (with-open [rdr (io/reader "/tmp/tshark.log")]
-                (->> (line-seq rdr) (parse-tshark nil) (parse-datomic-traffic) (into []))))
-  (frequencies (map :protocol events)))
+  ;; Bare TCP events, no protocol decoding -- decode-protocol falls back to
+  ;; :default (== :tcp) for any record when :port->protocol isn't given.
+  (def tcp-events (read-tshark "/tmp/tshark.log"))
+
+  ;; Only events after `since` (e.g. a session's start time, to skip
+  ;; startup noise) or before `until`.
+  (read-tshark "/tmp/tshark.log" :since (- (System/currentTimeMillis) 10000000))
+
+  ;; Registering protocol-specific decode-protocol methods (memcache/http/
+  ;; dynamodb live in their own namespaces -- see test/tshark_test.clj)
+  ;; lets read-tshark dispatch each record by its guessed :server-port.
+  (require '[memcache] '[http] '[dynamodb])
+  (def events (read-tshark "/tmp/tshark.log"
+                           :port->protocol {8000 :dynamodb 11211 :memcache}))
+
+  ;; Drops a noisy request (and its paired response) per stream, e.g. the
+  ;; transactor's pod-coord heartbeat.
+  (remove-noise (comp #{"pod-coord"} :key :dynamodb) events))

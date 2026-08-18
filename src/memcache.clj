@@ -39,7 +39,6 @@
                 payload   (when (and payload (< from to) (<= to (count payload)))
                             (Arrays/copyOfRange ^bytes payload (int from) (int to)))]]
       (assoc tcp-event
-        :type     :memcache
         :memcache {:operation operation
                    :key       k
                    :status    status

@@ -1,38 +1,38 @@
 (ns fressian-decode
-  (:require [clojure.data.fressian]
+  (:require [clojure.data.fressian :as fressian]
             [clojure.java.io])
   (:import (java.util List Set)
            (java.util.zip GZIPInputStream)
            (org.fressian TaggedObject)))
 
-(defmulti decode-tagged
+(defn- decode-tagged
   "Decodes one fressian TaggedObject's already-taggified values (`form`, the
-   vector of its component values) into a tag-specific representation --
-   dispatches on `tag` (the fressian tag string). Register a method here to
-   give a specific tag richer structure than the default (e.g. zip-columns
-   below, reconstructing parallel column arrays into row maps); the default
-   unwraps a single-value form and wraps whatever's left in a plain
-   tagged-literal, mirroring TaggedObject's own shape."
-  (fn [tag _form] tag))
-
-(defmethod decode-tagged :default [tag form]
-  (tagged-literal (symbol tag) (if (= 1 (count form)) (first form) form)))
+   vector of its component values) into a tag-specific representation, per
+   `readers` ({tag-string -> (fn [tag form] ...)}). Give a tag richer
+   structure than the default by adding an entry to `readers` (e.g.
+   zip-columns below, reconstructing parallel column arrays into row maps);
+   a tag missing from it unwraps a single-value form and wraps whatever's
+   left in a plain tagged-literal, mirroring TaggedObject's own shape."
+  [readers tag form]
+  (if-let [reader (get readers tag)]
+    (reader tag form)
+    (tagged-literal (symbol tag) (if (= 1 (count form)) (first form) form))))
 
 (defn- taggify
   "Recursively replace org.fressian.TaggedObject with clojure tagged literals
    (see decode-tagged), normalizing the java collections fressian hands back
    into clojure ones."
-  [x]
+  [readers x]
   (cond
     (instance? TaggedObject x)
     (let [^TaggedObject t x]
-      (decode-tagged (str (.getTag t)) (mapv taggify (.getValue t))))
+      (decode-tagged readers (str (.getTag t)) (mapv (partial taggify readers) (.getValue t))))
 
-    (record? x) (reduce-kv (fn [r k v] (assoc r k (taggify v))) x x)
-    (map? x) (reduce-kv (fn [m k v] (assoc m (taggify k) (taggify v))) {} x)
-    (instance? Set x) (into #{} (map taggify) x)
-    (instance? List x) (mapv taggify x)
-    (some-> x class .isArray) (mapv taggify x)
+    (record? x) (reduce-kv (fn [r k v] (assoc r k (taggify readers v))) x x)
+    (map? x) (reduce-kv (fn [m k v] (assoc m (taggify readers k) (taggify readers v))) {} x)
+    (instance? Set x) (into #{} (map (partial taggify readers)) x)
+    (instance? List x) (mapv (partial taggify readers) x)
+    (some-> x class .isArray) (mapv (partial taggify readers) x)
     :else x))
 
 (defn- gzip? [^bytes b]
@@ -40,25 +40,29 @@
        (= 0x1f (bit-and 0xff (aget b 0)))
        (= 0x8b (bit-and 0xff (aget b 1)))))
 
-(defn fressian-body? [^bytes b]
-  (and (pos? (alength b))
-       (let [b0 (bit-and 0xff (aget b 0))]
-         (or (= 0xfe b0)
-             (and (> (alength b) 1) (= 0x1f b0) (= 0x8b (bit-and 0xff (aget b 1))))))))
-
 (defn decode-body
-  "Decode one memcache value body: gunzip if needed, then fressian -> clojure."
-  [^bytes b]
-  (let [raw (if (gzip? b)
-              (with-open [in (GZIPInputStream. (clojure.java.io/input-stream b))]
-                (.readAllBytes in))
-              b)]
-    (taggify (clojure.data.fressian/read raw))))
+  "Decode one memcache value body: gunzip if needed, then fressian -> clojure.
+   `readers` ({tag-string -> (fn [tag form] ...)}), if given, overrides how
+   specific fressian tags are decoded -- see decode-tagged; a tag missing
+   from it falls back to `(tagged-literal (symbol tag) form)`."
+  ([b] (decode-body {} b))
+  ([readers ^bytes b]
+   (let [raw (if (gzip? b)
+               (with-open [in (GZIPInputStream. (clojure.java.io/input-stream b))]
+                 (.readAllBytes in))
+               b)]
+     (taggify readers (fressian/read raw)))))
 
 (comment
   (def byte-arr (byte-array [31 -117 8 0 0 0 0 0 0 -1 123 -1 -104 59 51 47 37 -75 66 -73 36 37 -79 36 -111 117 -85 -128 -120 -88 -104 -72 -124 -92 -108 -76 -123 -91 -107 -75 -115 -83 125 -128 -61 6 1 6 52 -80 89 -128 7 13 108 16 48 -125 2 11 48 8 112 8 112 -40 36 -16 21 13 -100 7 2 -96 -10 -100 -36 46 -107 67 0 127 77 -64 41 120 0 0 0]))
   (decode-body byte-arr)
-  (fressian-body? byte-arr)
+  (decode-body {"index-tdata"
+                (fn [tag form]
+                  (tagged-literal
+                    (symbol tag)
+                    (let [[v e a t added] form]
+                      (mapv #(zipmap [:e :a :v :t :added] %&) e a v t added))))}
+               byte-arr)
 
   ; Returns
   ;#index-tdata
