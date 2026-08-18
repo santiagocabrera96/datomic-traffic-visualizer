@@ -1,4 +1,8 @@
 (ns memcache
+  "Decodes memcache PDUs out of tshark TCP events -- see tshark-tcp->memcache.
+   Requires tshark (rather than the other way around) so that requiring this
+   namespace is what registers :memcache as a decode-protocol/read-tshark
+   :port->protocol value; tshark.clj itself knows nothing about memcache."
   (:require [tshark :refer [decode-protocol]]
             [utils :refer [->vec]])
   (:import (java.util Arrays)))
@@ -22,7 +26,17 @@
    0x82 :server-error
    0x83 :server-error})
 
-(defn tshark-tcp->memcache [tcp-event]
+(defn tshark-tcp->memcache
+  "One event per memcache PDU found in `tcp-event`'s :tcp :payload (a TCP
+   segment can coalesce several PDUs back-to-back, hence 1->many). tshark
+   parses each PDU's header fields into :layers :memcache but leaves the
+   payload as one undifferentiated byte blob for the whole segment, so the
+   value bytes for each PDU have to be sliced out by hand: `total_body_length`
+   is tshark's name for extras+key+value length (i.e. everything after the
+   fixed 24-byte header), and `reductions +` over each PDU's total on-wire
+   length (header included) gives the byte offset each PDU starts at within
+   the shared payload."
+  [tcp-event]
   (let [{{memcache :memcache} :layers
          {payload :payload}   :tcp} tcp-event
         ms       (->vec memcache)
@@ -49,3 +63,45 @@
   (->> (decode-protocol :tcp record)
        (filter (comp :memcache :layers))
        (mapcat tshark-tcp->memcache)))
+
+(comment
+  ;; A single memcache GET response PDU: opcode 0x00/status 0x00, key "foo",
+  ;; no extras, value "bar" -- total_body_length is key+value = 6, so the PDU
+  ;; is 24 (header) + 6 = 30 bytes on the wire. The header bytes themselves
+  ;; are never read by tshark-tcp->memcache (only the parsed
+  ;; memcache_memcache_* fields are), so they're left as zeros here.
+  (def get-response
+    {:layers {:memcache [{:memcache_memcache_opcode            "0"
+                          :memcache_memcache_status            "0"
+                          :memcache_memcache_key               "foo"
+                          :memcache_memcache_extras_length     "0"
+                          :memcache_memcache_key_length        "3"
+                          :memcache_memcache_total_body_length "6"}]}
+     :tcp    {:payload (byte-array (concat (repeat 24 (byte 0))
+                                            (map byte "foo")
+                                            (map byte "bar")))}})
+  (tshark-tcp->memcache get-response)
+  ;;=> ({..., :memcache {:operation :get, :key "foo", :status :ok,
+  ;;                     :payload #object[byte[] ...]}})
+  (String. ^bytes (:payload (:memcache (first (tshark-tcp->memcache get-response)))))
+  ;;=> "bar"
+
+  ;; decode-protocol :memcache is what read-tshark dispatches to once this ns
+  ;; is required (see tshark.clj's comment block). Unlike tshark-tcp->memcache
+  ;; above, it takes a *raw* tshark record (:layers :tcp with a hex payload
+  ;; string, not yet the shaped :tcp event) -- it decodes :tcp itself, filters
+  ;; down to records tshark actually parsed a memcache layer for, then expands
+  ;; each into its 1+ PDU events.
+  (require '[clojure.string :as str])
+  (def raw-record
+    {:layers {:tcp      {:tcp_tcp_srcport "11211"
+                         :tcp_tcp_dstport "54321"
+                         :tcp_tcp_payload (str/join ":" (map #(format "%02x" (bit-and % 0xff))
+                                                             (:payload (:tcp get-response))))
+                         :tcp_tcp_len     "30"
+                         :tcp_tcp_stream  "0"}
+              :memcache (:memcache (:layers get-response))}})
+  (decode-protocol :memcache raw-record)
+
+  opcode->command
+  status->outcome)

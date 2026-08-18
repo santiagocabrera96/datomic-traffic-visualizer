@@ -4,20 +4,27 @@
    decode Datomic's fressian-tagged shapes, and render the result as a
    PlantUML sequence diagram. Everything below is specific to *this* use
    case -- which protocol/colors/participant-names/Datomic shapes matter --
-   and deliberately lives outside src/, which only knows about tshark
-   capture parsing, protocol decoding, fressian decoding, and diagram
-   rendering as reusable, Datomic-agnostic pieces."
-  (:require [charred.api :as charred]
-            [clojure.edn :as edn]
+   and is deliberately kept separate from tshark.clj/diagram.clj/
+   fressian_decode.clj, which stay Datomic-agnostic and reusable as-is for
+   a different capture."
+  (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [dynamodb]
             [fressian-decode]
             [http]
             [memcache]
-            [tshark :refer [decode-protocol read-tshark remove-noise]]
-            [utils :refer [some-vals hex-payload->bytes update-in-if-present unpack-7bit-lsb ->vec]]))
+            [tshark :refer [read-tshark remove-noise]]
+            [utils :refer [update-in-if-present unpack-7bit-lsb]]))
 
-(defn event->draw [event]
+(defn event->draw
+  "Adds :tag/:note/:color per protocol. The cond order matters: on real
+   input a dynamodb event is also an http event (dynamodb/http->dynamodb
+   assoc's :dynamodb onto one), which is also a tcp event (http/tshark-tcp->http
+   assoc's :http onto one) -- likewise a memcache event is also a tcp event.
+   So :tcp/:http/:dynamodb (or :tcp/:memcache) are present simultaneously, and
+   checking the more specific protocol first is what makes a dynamodb event
+   draw pink instead of falling through to blue (http) or grey (tcp)."
+  [event]
   (cond (:memcache event) (let [{:keys [key operation payload]} (:memcache event)]
                             (assoc event
                               :tag (str (name operation) " " key)
@@ -52,7 +59,18 @@
 (defn decode-datomic-known-shapes
   "`readers` is passed straight through to fressian-decode/decode-body, for
    custom decoding of Datomic index tags (e.g. index-tdata) -- see
-   datomic-index-readers below for the real ones."
+   datomic-index-readers below for the real ones.
+
+   Two DynamoDB row shapes get special-cased here because their :S values
+   aren't plain scalars:
+   - pod-standby/pod-coord (the transactor's heartbeat rows, identified by
+     :id) store their :key as a printed EDN vector, e.g.
+     \"[host pid transactor-id peer-id ts version flag generation]\" --
+     edn/read-string undoes that.
+   - any other row keyed by a UUID stores its :v pre-packed 7 bits per
+     byte, LSB-first (see utils/unpack-7bit-lsb), so the whole string stays
+     within DynamoDB's ASCII-safe string type; unpacking then fressian-
+     decoding recovers the real value."
   ([event] (decode-datomic-known-shapes {} event))
   ([readers event]
    (cond
@@ -69,6 +87,11 @@
      :else event)))
 
 (def datomic-index-readers
+  "fressian-decode readers for Datomic's index-tagged shapes, each stored
+   column-wise (one array per field, e.g. all :e values then all :a values)
+   rather than row-wise -- these zip the parallel columns back into a
+   vector of row maps, which is what the rest of this codebase (and a
+   human skimming the diagram) actually wants to read."
   {"index-tdata"
    (fn [tag form]
      (tagged-literal
@@ -108,59 +131,46 @@
        (map (partial decode-datomic-known-shapes readers))))
 
 (comment
+  ;; event->draw, one plain event per protocol branch -- no capture file
+  ;; needed, these are just the shapes memcache/dynamodb/http/tshark's
+  ;; decode-protocol methods produce.
+  (event->draw {:memcache {:operation :get :key "foo" :payload "bar"}})
+  ;;=> tag "get foo", note "bar", color #FDFF94 (yellow)
+  (event->draw {:dynamodb {:operation "PutItem" :key "abc" :body {:x 1}}})
+  ;;=> tag "PutItem abc", note {:x 1}, color #FFAEFB (pink)
+  (event->draw {:dynamodb {:status 200}})
+  ;;=> no :operation (a response) -- tag falls back to "200"
+  (event->draw {:http {:request-method :get :uri "/foo" :headers {} :body nil}})
+  ;;=> tag "GET /foo", color #94C9FF (blue)
+  (event->draw {:tcp {:flags #{:SYN :ACK} :payload (byte-array (map byte "hi"))}})
+  ;;=> tag "ACK,SYN", note "hi", color #D3D3D3 (grey)
+
+  ;; attach-participants: a known port resolves by name, an unknown one
+  ;; becomes :unknown-<port> instead of nil.
+  (attach-participants {8000 :storage} {:tcp {:src-port 8000 :dst-port 9999}})
+  ;;=> {:from :storage :to :unknown-9999, ...}
+
+  ;; decode-datomic-known-shapes's three special-cased shapes.
+  (require '[clojure.data.fressian :as fressian])
+  (decode-datomic-known-shapes
+    {:memcache {:payload (let [buf (fressian/write "hello")
+                               arr (byte-array (.remaining buf))]
+                           (.get buf arr)
+                           arr)}})
+  ;;=> :memcache :payload fressian-decoded to "hello"
+  (decode-datomic-known-shapes
+    {:dynamodb {:body {:Item {:id {:S "pod-coord"} :key {:S "[\"host\" 1 2]"}}}}})
+  ;;=> :dynamodb :body :Item :key :S edn/read-string'd to ["host" 1 2]
+  (decode-datomic-known-shapes {:http {:status 200}})
+  ;;=> matches none of the three shapes -- returned untouched (:else)
+
   (require '[diagram])
-  ; Read tshark, try to decode per protocol if it has port->protocol, otherwise parse as :tcp.
-  ; Remove noise, assuming request/response in order.
-  ; Decode datomic known shapes.
-  ; Events -> {:tag :note :color :from :to} In two parts, ports->from-to and events->tag-note-color
-  ; Draw diagram with legend and regions.
-
-  (defmethod decode-protocol :pepe [_ record]
-    [{:hello :world}])
-  (read-tshark (->> [{:timestamp "1"
-                      :layers    {:tcp {:tcp_tcp_srcport "123"
-                                        :tcp_tcp_dstport "12"
-                                        :tcp_tcp_payload "00:01"
-                                        :tcp_tcp_len     "2"
-                                        :tcp_tcp_stream  "1"}}}]
-                    (map charred/write-json-str)
-                    (str/join "\n")))
-  (read-tshark (->> [{:timestamp "1"
-                      :layers    {:tcp {:tcp_tcp_srcport "123"
-                                        :tcp_tcp_dstport "12"
-                                        :tcp_tcp_payload "00:01"
-                                        :tcp_tcp_len "2"
-                                        :tcp_tcp_stream "1"}}}]
-                    (map charred/write-json-str)
-                    (str/join "\n"))
-               :port->protocol {12 :pepe})
-  (remove-method decode-protocol :pepe)
-
+  ;; The real pipeline, depending on an actual capture at /tmp/tshark.log --
+  ;; see tshark.clj's own comment block for a synthetic-input version of
+  ;; read-tshark itself.
   (def tshark-records (read-tshark "/tmp/tshark.log"
                                    :port->protocol {8000  :dynamodb
                                                     11211 :memcache}))
-  (def datomic-index-readers
-    {"index-tdata"
-     (fn [tag form]
-       (tagged-literal
-         (symbol tag)
-         (let [[v e a t added] form]
-           (mapv #(zipmap [:e :a :v :t :added] %&) e a v t added))))
-
-     "index-dir-node"
-     (fn [tag form]
-       (tagged-literal
-         (symbol tag)
-         (let [[index-tdata segment-id _ datom-count] form]
-           (mapv #(zipmap [:first-datom :seg-id :datom-count] %&) (:form index-tdata) segment-id datom-count))))
-
-     "index-root-node"
-     (fn [tag form]
-       (tagged-literal
-         (symbol tag)
-         (let [[index-tdata dir-id] form]
-           (mapv #(zipmap [:first-datom :dir-id] %&) (:form index-tdata) dir-id))))})
-
   (def events
     (->> tshark-records
          (remove-noise (comp #{"pod-coord"} :key :dynamodb))
@@ -173,8 +183,8 @@
      {:color "#D3D3D3" :label "TCP"}
      {:color "#94C9FF" :label "HTTP"}])
 
-  ; Regions, needed and orthogonal, is naming sections of the diagram by timestamp.
-  ; port->name, optional, not needed.
+  ; regions names sections of the diagram by timestamp; port-names is
+  ; optional (attach-participants falls back to :unknown-<port> without it).
   (diagram/write-svg! (map (comp event->draw (partial attach-participants port-names)) events) "/tmp/tshark.log.svg"
                       {:regions regions :legend legend}))
 

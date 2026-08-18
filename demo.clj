@@ -71,6 +71,10 @@
 ;; Log/tx-range: the transaction log itself, not just entity state.
 (region (into [] (d/tx-range (d/log conn) nil nil)))
 
+; TODO
+(def since (System/currentTimeMillis))
+
+
 ;; From @alex: Transactor will go put segments in memcache before announcing
 ;; that an indexing job happened. Trigger one explicitly, rather than
 ;; waiting for its usual schedule, so the capture sees that write.

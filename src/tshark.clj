@@ -20,11 +20,15 @@
 
 (defn- tcp-flags
   "Which of tshark's tcp.flags.* booleans are set on this :tcp layer, as a
-   set of keywords, e.g. #{:syn} or #{:ack :fin}."
+   set of keywords, e.g. #{:SYN} or #{:ACK :FIN}."
   [tcp]
   (into #{} (keep (fn [[field kw]] (when (true? (get tcp field)) kw))) flag-field->keyword))
 
-(defn- tshark->tcp [record]
+(defn- tshark->tcp
+  "Wrapped in a single-element vector (rather than returned bare) to match
+   decode-protocol's 1->0/1->many contract, so read-tshark can mapcat over
+   every method uniformly."
+  [record]
   (when-let [tcp (get-in record [:layers :tcp])]
     (let [flags (tcp-flags tcp)
           src-port (parse-long (:tcp_tcp_srcport tcp))
@@ -69,6 +73,9 @@
   (let [contents (if (.exists (io/file f)) (slurp f) f)
         records (for [line (str/split-lines contents)
                       :let [tshark-record (charred/read-json line :key-fn keyword)]
+                      ;; tshark's -T ek (bulk/Elasticsearch) json emits an
+                      ;; {:index ...} pseudo-record before each real one --
+                      ;; skip those rather than fail parsing them as packets
                       :when (not (:index tshark-record))
                       :let [tcp (:tcp (:layers tshark-record))
                             server-port (min (parse-long (:tcp_tcp_srcport tcp))
@@ -161,4 +168,19 @@
 
   ;; Drops a noisy request (and its paired response) per stream, e.g. the
   ;; transactor's pod-coord heartbeat.
-  (remove-noise (comp #{"pod-coord"} :key :dynamodb) events))
+  (remove-noise (comp #{"pod-coord"} :key :dynamodb) events)
+
+  ;; remove-noise pairs by (:stream (:tcp e)), not any top-level :stream --
+  ;; hand-build two synthetic requests + responses on *different* streams to
+  ;; see it drop only the matching pair and leave the other stream be. An
+  ;; event counts as a request when its :server-port equals its own :tcp
+  ;; :dst-port (see read-tshark for how :server-port is guessed).
+  (let [noisy-req    {:server-port 8000 :tcp {:dst-port 8000 :stream 1} :dynamodb {:key "pod-coord"}}
+        noisy-resp   {:server-port 8000 :tcp {:dst-port 55111 :stream 1}}
+        quiet-req    {:server-port 8000 :tcp {:dst-port 8000 :stream 2} :dynamodb {:key "item/42"}}
+        quiet-resp   {:server-port 8000 :tcp {:dst-port 55222 :stream 2}}]
+    (remove-noise (comp #{"pod-coord"} :key :dynamodb)
+                  [noisy-req quiet-req noisy-resp quiet-resp])
+    ;; => (quiet-req quiet-resp) -- the pod-coord pair on stream 1 is gone,
+    ;;    stream 2's pair survives untouched.
+    ))

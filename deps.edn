@@ -3,4 +3,9 @@
          com.amazonaws/aws-java-sdk-dynamodb {:mvn/version "1.12.564"}
          com.cnuernber/charred {:mvn/version "1.041"}
          org.clojure/data.fressian {:mvn/version "1.1.1"}
-         net.sourceforge.plantuml/plantuml {:mvn/version "1.2024.8"}}}
+         net.sourceforge.plantuml/plantuml {:mvn/version "1.2024.8"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps  {io.github.cognitect-labs/test-runner
+                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts   ["-m" "cognitect.test-runner"]}}}

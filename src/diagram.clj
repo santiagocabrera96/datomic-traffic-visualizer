@@ -282,6 +282,19 @@
   (write-diagram! events "/tmp/events.puml")
   (write-svg! events "/tmp/events.svg")
 
+  ;; :max-line-length shrinks skinparam wrapWidth *and* the threshold at
+  ;; which break-long-words forces a hard break -- a raw binary blob's
+  ;; escaped bytes have no whitespace for wrapWidth to wrap at on its own.
+  (println (events->plantuml [{:from :peer :to :dynamodb :timestamp 1 :tag "Blob"
+                               :note (apply str (repeat 200 "x"))}]
+                             {:max-line-length 20}))
+
+  ;; Adversarial payload: [ ] and # (creole link/numbered-list triggers),
+  ;; plus a C0 control char () that's XML-illegal -- all handled
+  ;; without throwing, and without corrupting the PlantUML/XML output.
+  (println (events->plantuml [{:from :peer :to :dynamodb :timestamp 1 :tag "Weird"
+                               :note {:payload (str "[link](x) #1 " (char 0x0B) " end")}}]))
+
   ;; The whole real pipeline lives in examples/datomic_caching.clj -- it
   ;; reads a tshark log, resolves :from/:to from ports itself, then calls
   ;; write-svg! with (optionally) setup's regions.

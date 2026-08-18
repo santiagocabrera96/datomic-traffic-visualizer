@@ -1,7 +1,11 @@
 (ns setup
-  "Runs local DynamoDB Local + memcached + Datomic transactor, connects a peer,
-  transacts the schema -- all as a side effect of the top-level forms at the
-  bottom, no -main. Installation/download stays in scripts/setup.sh."
+  "Orchestrates local DynamoDB Local + memcached + Datomic transactor
+  processes (start-all!/stop-all!), tracks which of them owns which port
+  (region/refresh-ports!/owner/start-port-watcher!), and dumps that state to
+  disk for a diagram render to read back later. Nothing runs on require --
+  the trailing (comment ...) block is a REPL script meant to be worked
+  through one form at a time, not evaluated top to bottom. Installation/
+  download stays in scripts/setup.sh."
   (:require [clojure.java.shell :as shell]
             [clojure.string :as str])
   (:import [java.io File BufferedReader InputStreamReader]
@@ -229,12 +233,20 @@
   (.destroy ^Process dynamodb))
 
 (comment
-  ;; Runs as soon as this namespace loads -- pids/port-owners only make sense
-  ;; once all three processes exist, so there's no partial start. TSHARK_LOG
-  ;; lets scripts/capture.sh's own log path drive this without editing code.
-  (def session (start-all! (or (System/getenv "TSHARK_LOG") "/tmp/tshark.log")))
+  ;; This block runs the same forms as demo.clj, form for form (minus its
+  ;; leading `(require ...)`, already in scope here, plus one extra note
+  ;; below on where to insert your own queries) -- load this namespace at
+  ;; the REPL and work through them one at a time, instead of running
+  ;; `clj -M demo.clj` unattended top to bottom.
 
-  (require '[datomic.api :as d])
+  ;; pids/port-owners only make sense once all three processes exist, so
+  ;; there's no partial start. TSHARK_LOG lets scripts/capture.sh's own log
+  ;; path drive this without editing code -- run that script, in its own
+  ;; terminal, before this one so tshark sees the initial TCP handshakes too.
+  (require '[clojure.edn :as edn] '[datomic.api :as d]
+           '[datomic-caching :refer [read-datomic-capture event->draw attach-participants]]
+           '[diagram])
+  (def session (start-all! (or (System/getenv "TSHARK_LOG") "/tmp/tshark.log")))
 
   (def db-uri "datomic:ddb-local://localhost:8000/datomic/caching-demo?aws_access_key_id=local&aws_secret_key=local")
 
@@ -258,13 +270,12 @@
   ;;   (region @(d/transact conn [{:item/id 1 :item/name "item-1"}]))
   ;;   (region (d/pull (d/db conn) '[*] [:item/id 1]))
   ;; wrapping a call in `region` labels its traffic in the diagram with that
-  ;; exact code. This whole block (below too) is also runnable top to
-  ;; bottom, unattended, as demo.clj -- `clj -M demo.clj`.
+  ;; exact code.
 
   ;; A sweep across the rest of the Datomic peer API, so a capture can be
   ;; validated against every shape of traffic the pipeline needs to decode
-  ;; (not just the transact/pull pair above). Each form's wrapped in `region`
-  ;; so it shows up labeled in events.svg.
+  ;; (not just create/connect/transact above). Each form's wrapped in
+  ;; `region` so it shows up labeled in the diagram.
 
   ;; Writes -- more item/id's so the queries below have something to chew on.
   (region @(d/transact conn [{:item/id 1 :item/name "item-1" :item/payload "abc"}]))
@@ -304,21 +315,30 @@
   ;; Log/tx-range: the transaction log itself, not just entity state.
   (region (into [] (d/tx-range (d/log conn) nil nil)))
 
-  ; From @alex: Transactor will go put segments in memcache before announcing that an indexing job happened.
-
-  ;; Trigger an indexing job explicitly -- request-index asks the transactor
-  ;; to run one now rather than waiting for its usual schedule, so a capture
-  ;; can see the segment-to-memcache writes @alex's note above describes.
-  (region (do (d/request-index conn)
+  ;; From @alex: Transactor will go put segments in memcache before
+  ;; announcing that an indexing job happened. Trigger one explicitly,
+  ;; rather than waiting for its usual schedule, so the capture sees that
+  ;; write.
+  (region "Indexing job"
+          (do (d/request-index conn)
               (Thread/sleep 3000)))
 
   ;; Render the capture into a sequence diagram. :since skips DynamoDB
   ;; Local/memcached/transactor startup noise below `session`'s start time.
-  ;; See examples/datomic_caching.clj for the actual pipeline (protocol
-  ;; decoding, noise removal, Datomic shape decoding, drawing) -- it reads
-  ;; (:tshark-log session)/(:since session) the same way.
-  (require 'datomic-caching)
+  ;; port-names (port -> :dynamodb/:memcached/:transactor/:peer) and
+  ;; regions ([{:label ... :start ... :end ...}], one per `region` call
+  ;; above) are start-all!'s live sweeps, each dumped to disk on every
+  ;; change -- read back from :ports-path/:regions-path so they reflect the
+  ;; whole run, not just whatever was known when start-all! returned
+  ;; `session`.
+  (def events (read-datomic-capture (:tshark-log session) :since (:since session)))
+  (def port-names (edn/read-string (slurp (:ports-path session))))
+  (def diagram-regions (edn/read-string (slurp (:regions-path session))))
+  (diagram/write-svg! (map (comp event->draw (partial attach-participants port-names)) events)
+                       (str (:tshark-log session) ".svg")
+                       {:regions diagram-regions})
 
-  ;; Manual teardown.
+  ;; Tear the stack down -- stop tshark's capture (Ctrl-C, in its own
+  ;; terminal) before or after this, it doesn't matter.
   (region (d/delete-database db-uri))
   (stop-all! session))
