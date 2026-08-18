@@ -32,6 +32,7 @@
           len (parse-long (:tcp_tcp_len tcp))
           stream (parse-long (:tcp_tcp_stream tcp))]
       [(assoc record
+         :type :tcp
          :tcp {:src-port src-port
                :dst-port dst-port
                :stream   stream
@@ -78,6 +79,7 @@
                 payload   (when (and payload (< from to) (<= to (count payload)))
                             (Arrays/copyOfRange ^bytes payload (int from) (int to)))]]
       (assoc tcp-event
+        :type     :memcache
         :memcache {:operation operation
                    :key       k
                    :status    status
@@ -110,6 +112,7 @@
           body-bytes     (byte-array (hex-payload->bytes (:http_http_file_data http)))
           body           (when (json-content-type? headers) (json-body body-bytes))]
       (assoc tcp-event
+        :type :http
         :http (some-vals
                 {:request-method request-method
                  :uri            uri
@@ -136,7 +139,8 @@
         decoded   body
         k         (dynamo-key decoded)]
     (assoc http-event
-      :dynamo (some-vals
+      :type :dynamodb
+      :dynamodb (some-vals
                 {:operation operation
                  :key       k
                  :status    status
@@ -161,14 +165,12 @@
 (defmethod decode-protocol :dynamodb [_ record]
   (map http->dynamo (decode-protocol :http record)))
 
+;TODO: Inline in the draw calls the color of the note.
 (defmulti draw
-  "Given a drawable event (see diagram/write-svg!) whose semantic detail
-   (:tcp/:memcache/:http/:dynamo) is already parsed and merged in, decides
+  "Given an event (:tcp/:memcache/:http/:dynamo) is already parsed and merged in, decides
    what diagram.clj should draw for it, returning `event` with :tag/:note
-   added. Dispatches on :protocol -- the one place that decision lives.
-   Called once, right before drawing (see the `comment` block below) -- not
-   by the protocol parsers above."
-  :protocol)
+   added. Dispatches on :type."
+  :type)
 
 (defn- flags->tag [flags]
   (str/join "," (map name (filter flags flag-order))))
@@ -193,7 +195,7 @@
              :body body})))
 
 (defmethod draw :dynamodb [event]
-  (let [{:keys [operation key body status]} (:dynamo event)]
+  (let [{:keys [operation key body status]} (:dynamodb event)]
     (assoc event
       :tag  (if operation (str operation " " key) (str status))
       :note body)))
@@ -245,66 +247,51 @@
     (seq (:payload (:memcache event)))
     (update-in event [:memcache :payload] fressian-decode/decode-body)
 
-    (#{"pod-standby" "pod-coord"} (:S (:id (:Item (:body (:dynamo event))))))
-    (update-in-if-present event [:dynamo :body :Item :key :S] edn/read-string)
+    (#{"pod-standby" "pod-coord"} (:S (:id (:Item (:body (:dynamodb event))))))
+    (update-in-if-present event [:dynamodb :body :Item :key :S] edn/read-string)
 
-    (some-> (:S (:id (:Item (:body (:dynamo event))))) parse-uuid)
-    (update-in-if-present event [:dynamo :body :Item :v :S] (comp fressian-decode/decode-body unpack-7bit-lsb))
+    (some-> (:S (:id (:Item (:body (:dynamodb event))))) parse-uuid)
+    (update-in-if-present event [:dynamodb :body :Item :v :S] (comp fressian-decode/decode-body unpack-7bit-lsb))
 
     :else event))
 
-(defn read-tshark-lines
-  "Raw tshark records from `file-or-contents` -- either a path to a tshark
-   capture log, or its JSON-lines contents already read into a string.
-   Drops ES bulk-index lines and parses each record's :timestamp to a long.
-   Doesn't know about ports or protocols -- see tag-protocol for that."
-  [file-or-contents]
-  (let [contents (if (str/includes? file-or-contents "\n") file-or-contents (slurp file-or-contents))]
-    (for [line (str/split-lines contents)
-          :let [tshark-record (charred/read-json line :key-fn keyword)]
-          :when (not (:index tshark-record))]
-      (update tshark-record :timestamp parse-long))))
-
-(defn tag-protocol
-  "tshark-record with its :src-port/:dst-port/:stream (read off its own tcp
-   layer) and :protocol (looked up in `server-ports` by src or dst port, nil
-   if neither matches) assoc'd on."
-  [server-ports tshark-record]
-  (let [{{{src-port :tcp_tcp_srcport
-           dst-port :tcp_tcp_dstport
-           stream   :tcp_tcp_stream} :tcp} :layers} tshark-record
-        src-port (parse-long src-port)
-        dst-port (parse-long dst-port)
-        stream   (parse-long stream)]
-    (assoc tshark-record
-      :src-port src-port
-      :dst-port dst-port
-      :stream   stream
-      :protocol (or (get server-ports src-port)
-                    (get server-ports dst-port)))))
-
 (comment
   (require '[diagram])
+
+  ; Ignore the following 10 lines
+  ; Parts: Parse tshark with tcp protocol
+  ; Draw a diagram, should contain tag, note, from, to, and color. The legend is another parameter.
+  ; Parse datomic known shapes
+  ; fressian decode
+  ; utils
 
   (def server-ports
     {8000 :dynamodb
      11211 :memcache})
 
   (defn- noisy? [event]
-    (#{"pod-coord"} (get-in event [:dynamo :key])))
+    (#{"pod-coord"} (get-in event [:dynamodb :key])))
+
+  (def tshark-records (for [line (str/split-lines (slurp "/tmp/tshark.log"))
+                            :let [tshark-record (charred/read-json line :key-fn keyword)]
+                            :when (not (:index tshark-record))
+                            event (decode-protocol :tcp (update tshark-record :timestamp parse-long))]
+                        (assoc event :server-port (min (get-in event [:tcp :src-port])
+                                                       (get-in event [:tcp :dst-port])))))
   (def events
-    (->> (read-tshark-lines "/tmp/tshark.log")
-         (map (partial tag-protocol server-ports))
-         (mapcat #(decode-protocol (:protocol %) %))
+    (->> tshark-records
+         (mapcat #(decode-protocol (get server-ports (:server-port %)) %))
          (remove-noise server-ports noisy?)
          (map decode-datomic)))
   (def port-names (clojure.edn/read-string (slurp "/tmp/tshark.log.ports.edn")))
   (def regions (clojure.edn/read-string (slurp "/tmp/tshark.log.regions.edn")))
+  ; TODO: This should be renamed from protocol styles to a plantuml name (legend I think it is). So it should be a vector of :color and :label.
   (def protocol-styles
     {:dynamodb {:color "#FFAEFB" :label "Storage (DynamoDB)"}
      :memcache {:color "#FDFF94" :label "Cache (memcached)"}
      :tcp      {:color "#D3D3D3" :label "TCP"}
      :http     {:color "#94C9FF" :label "HTTP"}})
+  ; TODO: Remove the usage of the protocol to know which color should an event have. The event should have a color, otherwise fallback to a default.
   (diagram/write-svg! (map draw events) "/tmp/tshark.log.svg"
                       {:port-names port-names :regions regions :protocol-styles protocol-styles})
 
