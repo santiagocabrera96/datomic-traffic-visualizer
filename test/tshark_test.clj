@@ -6,6 +6,14 @@
             [tshark :refer [decode-protocol read-tshark remove-noise]]
             [utils :refer [some-vals hex-payload->bytes update-in-if-present unpack-7bit-lsb ->vec]]))
 
+; TODO: Where would it make sense to have event->draw, attach-participants, and decode-datomic shapes?
+;; How to decode a protocol is user specific.
+;; Making that parsed event to something drawable is user specific.
+;; atttach-participants is linked with running processes locally. We might run in different hosts and use hostnames for
+;; the names, so how to move from events to :from/:to values is user specific.
+;; In different ports we might have different colors, like 5XX http responses. So it also is user specific.
+;; The fact that this use case uses datomic is also specific for this example.
+;; The regions is diagram specific, we just provide an aid with saving the regions somewhere.
 
 (defn event->draw [event]
   (cond (:memcache event) (let [{:keys [key operation payload]} (:memcache event)]

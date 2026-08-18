@@ -45,6 +45,7 @@
                :flags    flags
                :payload  payload})])))
 
+; TODO: Explain or make clear that adding a defmethod for a protocol here is part of the interface for read-tshark usage.
 (defmulti decode-protocol (fn [protocol _record] protocol))
 
 (defmethod decode-protocol :tcp [_ record]
