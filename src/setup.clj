@@ -314,8 +314,10 @@
 
   ;; Render the capture into a sequence diagram. :since skips DynamoDB
   ;; Local/memcached/transactor startup noise below `session`'s start time.
-  (require 'tshark)
-  (tshark/draw-diagram! (:tshark-log session) {:since (:since session)})
+  ;; See examples/datomic_caching.clj for the actual pipeline (protocol
+  ;; decoding, noise removal, Datomic shape decoding, drawing) -- it reads
+  ;; (:tshark-log session)/(:since session) the same way.
+  (require 'datomic-caching)
 
   ;; Manual teardown.
   (region (d/delete-database db-uri))

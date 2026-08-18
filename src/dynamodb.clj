@@ -1,5 +1,7 @@
 (ns dynamodb
-  (:require [utils :refer [some-vals]]))
+  (:require [http]
+            [tshark :refer [decode-protocol]]
+            [utils :refer [some-vals]]))
 
 (defn- dynamo-operation
   "DynamoDB's operation name, e.g. \"PutItem\" -- the part of the
@@ -25,3 +27,6 @@
                    :key       k
                    :status    status
                    :body      decoded}))))
+
+(defmethod decode-protocol :dynamodb [_ record]
+  (map http->dynamodb (decode-protocol :http record)))

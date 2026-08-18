@@ -282,7 +282,7 @@
   (write-diagram! events "/tmp/events.puml")
   (write-svg! events "/tmp/events.svg")
 
-  ;; The whole real pipeline lives in process -- it reads a tshark log,
-  ;; resolves :from/:to from ports itself, then calls write-svg! with
-  ;; (optionally) setup's regions.
+  ;; The whole real pipeline lives in examples/datomic_caching.clj -- it
+  ;; reads a tshark log, resolves :from/:to from ports itself, then calls
+  ;; write-svg! with (optionally) setup's regions.
   )

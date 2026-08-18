@@ -2,18 +2,13 @@
   "Parses a tshark -T json capture log into TCP-layer events -- see
    read-tshark. `decode-protocol` is an open multimethod dispatching on
    protocol keyword; only :tcp (and :default, which just falls back to :tcp)
-   are registered here. Protocol-specific decoding (memcache, http, dynamodb),
-   plus drawing/participant-naming/Datomic-body-decoding, are layered on top
-   by registering more decode-protocol methods elsewhere -- see
-   test/tshark_test.clj for the real pipeline."
+   are registered here. Adding a protocol means requiring its namespace and
+   registering a `decode-protocol` defmethod for it -- see memcache.clj,
+   http.clj, and dynamodb.clj, which each do exactly that for themselves."
   (:require [charred.api :as charred]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [fressian-decode]
-            [memcache :refer [tshark-tcp->memcache]]
-            [http :refer [tshark-tcp->http]]
-            [dynamodb :refer [http->dynamodb]]
-            [utils :refer [some-vals hex-payload->bytes update-in-if-present unpack-7bit-lsb]]))
+            [utils :refer [hex-payload->bytes]]))
 
 (def ^:private flag-field->keyword
   {:tcp_tcp_flags_syn   :SYN
@@ -45,27 +40,18 @@
                :flags    flags
                :payload  payload})])))
 
-; TODO: Explain or make clear that adding a defmethod for a protocol here is part of the interface for read-tshark usage.
-(defmulti decode-protocol (fn [protocol _record] protocol))
+(defmulti decode-protocol
+  "Open dispatch on protocol keyword, e.g. :memcache/:http/:dynamodb -- see
+   read-tshark's :port->protocol. Adding a protocol is registering a
+   defmethod for it; :tcp and :default (a plain :tcp fallback) are the only
+   ones registered here."
+  (fn [protocol _record] protocol))
 
 (defmethod decode-protocol :tcp [_ record]
   (tshark->tcp record))
 
 (defmethod decode-protocol :default [_ record]
   (decode-protocol :tcp record))
-
-(defmethod decode-protocol :memcache [_ record]
-  (->> (decode-protocol :tcp record)
-       (filter (comp :memcache :layers))
-       (mapcat tshark-tcp->memcache)))
-
-(defmethod decode-protocol :http [_ record]
-  (->> (decode-protocol :tcp record)
-       (filter (comp :http :layers))
-       (map tshark-tcp->http)))
-
-(defmethod decode-protocol :dynamodb [_ record]
-  (map http->dynamodb (decode-protocol :http record)))
 
 (defn read-tshark
   "Parse tshark lines from `f`, but will guess the server port and parse the
@@ -105,15 +91,14 @@
    a stream with several in-flight requests remembers each one in order);
    assumes responses come back in the same order their requests were sent,
    per stream. One pass over the seq, no need to hold it all in memory, and
-   no metadata added to surviving events. `server-ports` is the same
-   port->protocol map passed to `tag-protocol` -- its keys are the
-   destination ports whose events count as requests (see `request?`).
+   no metadata added to surviving events. An event counts as a request when
+   its `:server-port` (see read-tshark) matches its own :tcp :dst-port,
+   response otherwise.
 
-   Called with `server-ports` and `noisy?`, returns the transducer, for
-   composing into a larger `comp` chain; called with `server-ports`,
-   `noisy?`, and a seq of events, applies it directly and returns the
-   resulting (lazy) seq -- same two-arity convention as
-   `clojure.core/map`/`filter`/etc."
+   Called with just `noisy?`, returns the transducer, for composing into a
+   larger `comp` chain; called with `noisy?` and a seq of events, applies it
+   directly and returns the resulting (lazy) seq -- same two-arity
+   convention as `clojure.core/map`/`filter`/etc."
   ([noisy?]
    (fn [rf]
      (let [pending (volatile! {})]
@@ -121,7 +106,7 @@
          ([] (rf))
          ([result] (rf result))
          ([result e]
-          (let [stream (:stream e)]
+          (let [stream (:stream (:tcp e))]
             (cond
               (= (:server-port e) (:dst-port (:tcp e)))
               (let [drop? (boolean (noisy? e))]
@@ -138,23 +123,41 @@
   ([noisy? events] (sequence (remove-noise noisy?) events)))
 
 (comment
-  ; TODO: Add example on how to implement another protocol.
-  ; TODO: Examples should not assume a file "/tmp/tshark.log" exists.
-
-  ;; Bare TCP events, no protocol decoding -- decode-protocol falls back to
-  ;; :default (== :tcp) for any record when :port->protocol isn't given.
-  (def tcp-events (read-tshark "/tmp/tshark.log"))
+  ;; A minimal capture: one TCP record, no protocol decoding -- decode-protocol
+  ;; falls back to :default (== :tcp) for any record when :port->protocol
+  ;; isn't given. read-tshark accepts either a path or the raw contents
+  ;; themselves (checked via io/file's .exists), so no capture file is needed
+  ;; here.
+  (require '[charred.api :as charred] '[clojure.string :as str])
+  (def sample-log
+    (->> [{:timestamp "1"
+           :layers    {:tcp {:tcp_tcp_srcport "123"
+                             :tcp_tcp_dstport "12"
+                             :tcp_tcp_payload "00:01"
+                             :tcp_tcp_len     "2"
+                             :tcp_tcp_stream  "1"}}}]
+         (map charred/write-json-str)
+         (str/join "\n")))
+  (read-tshark sample-log)
 
   ;; Only events after `since` (e.g. a session's start time, to skip
   ;; startup noise) or before `until`.
-  (read-tshark "/tmp/tshark.log" :since (- (System/currentTimeMillis) 10000000))
+  (read-tshark sample-log :since (- (System/currentTimeMillis) 10000000))
 
-  ;; Registering protocol-specific decode-protocol methods (memcache/http/
-  ;; dynamodb live in their own namespaces -- see test/tshark_test.clj)
-  ;; lets read-tshark dispatch each record by its guessed :server-port.
+  ;; Implementing a new protocol is a defmethod, wherever it's convenient to
+  ;; put it -- own namespace (see memcache.clj/http.clj/dynamodb.clj), the
+  ;; consuming code, a REPL scratch buffer. Here inline, dispatching on a
+  ;; made-up port and cleaning up after itself with remove-method.
+  (defmethod decode-protocol :pepe [_ record]
+    [(assoc record :pepe {:hello :world})])
+  (read-tshark sample-log :port->protocol {12 :pepe})
+  (remove-method decode-protocol :pepe)
+
+  ;; Registering memcache/http/dynamodb (each registers its own
+  ;; decode-protocol method on require -- see their namespaces) lets
+  ;; read-tshark dispatch each record by its guessed :server-port.
   (require '[memcache] '[http] '[dynamodb])
-  (def events (read-tshark "/tmp/tshark.log"
-                           :port->protocol {8000 :dynamodb 11211 :memcache}))
+  (def events (read-tshark sample-log :port->protocol {8000 :dynamodb 11211 :memcache}))
 
   ;; Drops a noisy request (and its paired response) per stream, e.g. the
   ;; transactor's pod-coord heartbeat.

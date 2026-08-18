@@ -1,5 +1,6 @@
 (ns memcache
-  (:require [utils :refer [->vec]])
+  (:require [tshark :refer [decode-protocol]]
+            [utils :refer [->vec]])
   (:import (java.util Arrays)))
 
 (def opcode->command
@@ -43,3 +44,8 @@
                    :key       k
                    :status    status
                    :payload   payload}))))
+
+(defmethod decode-protocol :memcache [_ record]
+  (->> (decode-protocol :tcp record)
+       (filter (comp :memcache :layers))
+       (mapcat tshark-tcp->memcache)))

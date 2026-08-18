@@ -1,6 +1,7 @@
 (ns http
   (:require [charred.api :as charred]
             [clojure.string :as str]
+            [tshark :refer [decode-protocol]]
             [utils :refer [->vec hex-payload->bytes some-vals]]))
 
 (defn- json-body
@@ -36,3 +37,8 @@
                  :headers        headers
                  :status         status
                  :body           body})))))
+
+(defmethod decode-protocol :http [_ record]
+  (->> (decode-protocol :tcp record)
+       (filter (comp :http :layers))
+       (map tshark-tcp->http)))
