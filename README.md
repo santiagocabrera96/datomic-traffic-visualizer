@@ -9,6 +9,27 @@ AWS) for storage, plus a local **memcached** for the transactor's object
 cache, plus this JVM acting as the peer. Everything runs on `127.0.0.1`, on
 different ports (8000 = DynamoDB Local, 11211 = memcached).
 
+## Quick start
+
+1. Setup (one-time install of memcached/tshark, Datomic
+   Pro, and DynamoDB Local).
+```
+./scripts/setup.sh
+```
+2. In a terminal, run 
+```
+scripts/capture.sh
+```
+and leave it running.
+3. While it runs, run 
+```
+clj -M demo.clj
+``` 
+in another terminal.
+4. Once `demo.clj` finishes, stop the capture (Ctrl-C).
+
+See "Running it end to end" below for details on each step.
+
 ## File layout
 
 `src/` is split into reusable, Datomic-agnostic pieces (parsing a tshark
