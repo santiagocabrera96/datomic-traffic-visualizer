@@ -9,6 +9,13 @@ AWS) for storage, plus a local **memcached** for the transactor's object
 cache, plus this JVM acting as the peer. Everything runs on `127.0.0.1`, on
 different ports (8000 = DynamoDB Local, 11211 = memcached).
 
+A real run's diagram is enormous (hundreds of thousands of SVG elements,
+tens of thousands of pixels tall) — too big for GitHub to render inline.
+Here's the top slice, showing the transactor's startup handshake with
+DynamoDB Local:
+
+![Sequence diagram preview](docs/tshark-preview.svg)
+
 ## Quick start
 
 1. Setup (one-time install of memcached/tshark, Datomic
